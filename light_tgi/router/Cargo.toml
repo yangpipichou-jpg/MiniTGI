@@ -1,0 +1,44 @@
+[package]
+name = "light-tgi-router"
+version = "0.1.0"
+edition = "2021"
+description = "Light TGI Router - 高性能 LLM 推理调度器 (教学项目)"
+
+[dependencies]
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+
+# HTTP 框架
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+hyper = "1"
+
+# gRPC
+tonic = "0.11"
+prost = "0.12"
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 工具
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tokio-stream = "0.1"
+thiserror = "1"
+anyhow = "1"
+parking_lot = "0.12"
+dashmap = "5"
+
+# 日志
+tracing-appender = "0.2"
+chrono = "0.4"
+
+[build-dependencies]
+tonic-build = "0.11"
+
+[[bin]]
+name = "light-tgi-router"
+path = "src/main.rs"

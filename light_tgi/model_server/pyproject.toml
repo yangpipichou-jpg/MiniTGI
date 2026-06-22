@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "light-tgi-model-server"
+version = "0.1.0"
+description = "Light TGI Model Server - Python gRPC 模型推理服务 (教学项目)"
+requires-python = ">=3.10"
+dependencies = [
+    "grpcio>=1.60",
+    "protobuf>=4.25",
+    "torch>=2.0",
+    "transformers>=4.36",
+    "accelerate>=0.25",
+]
+
+[project.optional-dependencies]
+dev = [
+    "grpcio-tools>=1.60",
+]
