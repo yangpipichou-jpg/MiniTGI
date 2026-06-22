@@ -1,7 +1,7 @@
 # Light TGI — 轻量级 LLM 推理调度器设计文档
 
 > **教学项目** | 参考 HuggingFace Text Generation Inference (TGI) 架构设计  
-> 作者：AI 教学助手 | 日期：2026-06-21
+> 版本: v2.0 (真实模型版本) | 模型: Qwen2.5-1.5B-Instruct | 日期: 2026-06-22
 
 ---
 
@@ -31,23 +31,27 @@ Light TGI 是 HuggingFace [Text Generation Inference (TGI)](https://github.com/h
 
 | 特性 | 说明 |
 |------|------|
+| **真实模型推理** | 加载 HuggingFace Qwen2.5-1.5B-Instruct 进行真实推理 |
 | **Continuous Batching** | 动态批处理，新请求可随时加入正在运行的 batch |
 | **过载保护** | Semaphore 信号量限制并发，超出立即返回 429 |
 | **流式输出** | SSE (Server-Sent Events) 实时推送生成的 token |
 | **gRPC 通信** | Rust ↔ Python 通过 Protobuf 定义的 gRPC 高效通信 |
-| **KV Cache 管理** | Prefill 生成的 KV Cache 被 Decode 复用 |
+| **KV Cache 复用** | past_key_values 在 Prefill 和 Decode 间传递，避免重复计算 |
 | **预算驱动调度** | 基于 token 预算动态组 batch，平衡延迟与吞吐量 |
+| **K8S 部署** | Dockerfile + Deployment + Service + HPA，生产就绪 |
 
 ### 1.3 与 TGI 的对比
 
-| 维度 | TGI (生产级) | Light TGI (教学版) |
-|------|-------------|-------------------|
-| 模型加载 | 真实权重 + FlashAttention + Tensor Parallel | 模拟 token 生成 |
-| KV Cache | PagedAttention / FlashInfer | 简化模拟 |
-| 量化 | GPT-Q, AWQ, FP8, ... | 无 |
+| 维度 | TGI (生产级) | Light TGI (教学版 v2) |
+|------|-------------|----------------------|
+| 模型加载 | 真实权重 + FlashAttention + Tensor Parallel | 真实 HuggingFace 模型 (Qwen2.5-1.5B) |
+| KV Cache | PagedAttention / FlashInfer | past_key_values 复用 |
+| 量化 | GPT-Q, AWQ, FP8, ... | 支持 float16 (GPU) |
 | 调度器 | 完整实现 | 核心算法保留 |
+| Tokenization | Rust 端独立 tokenizer 线程 | gRPC Tokenize RPC (Python 端) |
 | 架构 | 完全相同 | 完全相同 |
-| 代码量 | ~50K 行 Rust + ~20K 行 Python | ~1.5K 行 Rust + ~500 行 Python |
+| 部署 | Docker + K8S | Docker + K8S (含 HPA) |
+| 代码量 | ~50K 行 Rust + ~20K 行 Python | ~2K 行 Rust + ~500 行 Python |
 
 ---
 
@@ -370,34 +374,36 @@ async fn collect_batch(&self, receiver) -> Vec<QueueEntry> {
 Client                    Router (Rust)                  Model Server (Python)
   │                           │                                │
   │── POST /generate ────────▶│                                │
-  │                           │── 1. 验证输入长度               │
-  │                           │── 2. try_acquire() 过载保护    │
-  │                           │── 3. 创建 QueueEntry            │
-  │                           │── 4. queue.enqueue()            │
-  │                           │── 5. notify_one()               │
+  │                           │── 1. gRPC Tokenize() ─────────▶│── tokenizer.encode()
+  │                           │◀─────── token_count ──────────│
+  │                           │── 2. 验证输入长度               │
+  │                           │── 3. try_acquire() 过载保护    │
+  │                           │── 4. 创建 QueueEntry(原始文本)  │
+  │                           │── 5. queue.enqueue()            │
+  │                           │── 6. notify_one()               │
   │◀── SSE stream ────────────│                                │
   │                           │                                │
   │                    [后台批处理任务]                          │
-  │                           │── 6. wait_for_notify()          │
-  │                           │── 7. collect_batch() 组 batch   │
-  │                           │── 8. grpc Prefill ─────────────▶│
-  │                           │                                │── Prefill 计算
-  │                           │◀─────── PrefillResponse ───────│  (生成首token+KV Cache)
+  │                           │── 7. wait_for_notify()          │
+  │                           │── 8. collect_batch() 组 batch   │
+  │                           │── 9. grpc Prefill ─────────────▶│
+  │                           │   (发送原始文本)                │── tokenizer + forward()
+  │                           │◀─────── PrefillResponse ───────│  (首token+past_key_values)
   │                           │                                │
-  │                           │── 9. 发送首 token 到 response_tx│
+  │                           │── 10. 发送首 token 到 response_tx│
   │◀── SSE: token_1 ─────────│                                │
   │                           │                                │
   │                    [Decode 循环]                            │
-  │                           │── 10. grpc Decode ────────────▶│
-  │                           │                                │── Decode 计算
-  │                           │◀─────── DecodeResponse ────────│  (生成下一个token)
-  │                           │── 11. 发送 token 到 response_tx │
+  │                           │── 11. grpc Decode ────────────▶│
+  │                           │   (past_key_values + token)    │── forward() + 采样
+  │                           │◀─────── DecodeResponse ────────│  (下一个token)
+  │                           │── 12. 发送 token 到 response_tx │
   │◀── SSE: token_2 ─────────│                                │
-  │                           │      ... (重复 step 10-11)      │
+  │                           │      ... (重复 step 11-12)      │
   │                           │                                │
-  │                           │── 12. 检测 EOS / max_tokens     │
+  │                           │── 13. 检测 EOS / max_tokens     │
   │◀── SSE: [DONE] ──────────│                                │
-  │                           │── 13. ClearCache ─────────────▶│── 释放 KV Cache
+  │                           │── 14. ClearCache ─────────────▶│── 释放 past_key_values
   │                           │                                │
 ```
 
@@ -451,16 +457,22 @@ Decode 阶段错误
 
 **文件**: `proto/generation.proto`
 
-### 6.1 服务定义
+### 6.1 服务定义 (v2)
 
 ```protobuf
 service TextGenerationService {
   rpc Health(ModelInfoRequest) returns (ModelInfoResponse);
+  rpc Tokenize(TokenizeRequest) returns (TokenizeResponse);    // ★ 新增
   rpc Prefill(BatchPrefillRequest) returns (BatchPrefillResponse);
   rpc Decode(BatchDecodeRequest) returns (BatchDecodeResponse);
   rpc ClearCache(ClearCacheRequest) returns (ClearCacheResponse);
 }
 ```
+
+**v2 关键变更**：
+- `PrefillRequest.input_text` (string) 替代 `input_ids` (repeated int32) — Router 传原始文本
+- 新增 `Tokenize` RPC — 供 Router 做输入长度验证，调用 Python tokenizer
+- `PrefillResponse.prompt_token_count` — 返回 prompt 的实际 token 数
 
 ### 6.2 批量接口设计
 
@@ -479,32 +491,30 @@ TGI 使用**批量接口**而非逐个请求发送，原因：
   grpc_client.prefill_batch([req1, req2, ..., reqN])  ← 1 次 RPC
 ```
 
-### 6.3 关键消息类型
+### 6.3 关键消息类型 (v2)
 
 ```protobuf
-// Prefill 请求 — 发送 prompt 和生成参数
-message PrefillRequest {
-  string request_id = 1;          // UUID 追踪
-  repeated int32 input_ids = 2;   // tokenized prompt
-  GenerationParameters params = 3; // 采样参数
-  repeated int32 slot_ids = 4;    // KV cache slot
-  int32 batch_id = 5;             // batch 内索引
+// Tokenize: Router 验证输入长度
+message TokenizeRequest { string text = 1; }
+message TokenizeResponse {
+  repeated int32 token_ids = 1;
+  int32 token_count = 2;
 }
 
-// Prefill 响应 — 返回首 token + KV Cache 句柄
+// Prefill 请求 — ★ 发送原始文本 (不再传 token ids)
+message PrefillRequest {
+  string request_id = 1;
+  string input_text = 2;           // ★ 原始文本
+  GenerationParameters params = 3;
+}
+
+// Prefill 响应 — 返回首 token + KV Cache 句柄 + prompt token 数
 message PrefillResponse {
   string request_id = 1;
   repeated Token generated_tokens = 2;
-  int64 cache_handle = 3;         // KV Cache 句柄 (后续 decode 使用)
-  int32 prefill_duration_ms = 4;  // 性能指标
-}
-
-// Decode 请求 — 携带 KV Cache 句柄
-message DecodeRequest {
-  string request_id = 1;
-  int32 token_id = 2;
-  int64 cache_handle = 3;         // 从 Prefill 获取的句柄
-  GenerationParameters params = 4;
+  int64 cache_handle = 3;
+  int32 prefill_duration_ms = 4;
+  int32 prompt_token_count = 5;    // ★ 新增
 }
 ```
 
@@ -715,17 +725,123 @@ pub struct GrpcClient {
 
 ---
 
-## 8. Python Model Server 源码详解
+## 8. Python Model Server 源码详解 (v2 真实模型)
 
 ### 8.1 项目结构
 
 ```
 model_server/
-├── pyproject.toml        # Python 项目配置
+├── pyproject.toml        # Python 项目配置 (新增 sentencepiece)
 ├── generate_proto.py     # 编译 proto → Python 代码
-├── grpc_server.py        # gRPC 服务实现 (入口)
-├── model_engine.py       # 模型推理引擎 (核心)
+├── grpc_server.py        # gRPC 服务实现 (新增 Tokenize RPC)
+├── model_engine.py       # ★ 真实 HuggingFace 模型推理引擎
 └── test_client.py        # gRPC 测试客户端
+```
+
+### 8.2 model_engine.py — 真实模型推理引擎
+
+**核心变更**: 从模拟 token 生成 → 加载真实 HuggingFace 模型
+
+```python
+class ModelEngine:
+    def __init__(self, model_id="Qwen/Qwen2.5-1.5B-Instruct", device="cpu"):
+        # ★ 加载真实 tokenizer 和模型
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16,  # GPU 半精度
+            device_map=device,
+        )
+        self.model.eval()
+```
+
+**Prefill 实现 (真实推理)**:
+
+```python
+def prefill(self, request_id, input_text, ...):
+    # 1. Tokenize
+    input_ids = self.tokenizer.encode(input_text)
+    input_tensor = torch.tensor([input_ids], device=self.device)
+    
+    # 2. ★ 真实 forward pass
+    with torch.no_grad():
+        outputs = self.model(
+            input_ids=input_tensor,
+            attention_mask=attention_mask,
+            use_cache=True,  # 启用 KV Cache
+        )
+    
+    # 3. 从 logits[-1] 采样第一个 token
+    logits = outputs.logits[:, -1, :]
+    first_token_id = self._sample_token(logits, temperature, top_p, top_k)
+    
+    # 4. ★ 保存 past_key_values (真实的 KV Cache)
+    entry = CacheEntry(
+        handle=handle,
+        past_key_values=outputs.past_key_values,  # transformers DynamicCache
+        generated_ids=list(input_ids) + [first_token_id],
+    )
+```
+
+**Decode 实现 (KV Cache 复用)**:
+
+```python
+def decode(self, request_id, cache_handle, ...):
+    entry = self._cache[cache_handle]
+    last_token = entry.generated_ids[-1]
+    
+    # ★ 使用 past_key_values 做增量推理
+    with torch.no_grad():
+        outputs = self.model(
+            input_ids=torch.tensor([[last_token]]),
+            past_key_values=entry.past_key_values,  # 复用 KV Cache
+            use_cache=True,
+        )
+    
+    # 更新 past_key_values
+    entry.past_key_values = outputs.past_key_values
+```
+
+**批量 Prefill (Left-Padding)**:
+
+```python
+def batch_prefill(self, requests):
+    # Tokenize 所有请求
+    all_input_ids = [tokenizer.encode(req["input_text"]) for req in requests]
+    
+    # Left-padding: 短序列左侧补 pad_token
+    max_len = max(len(ids) for ids in all_input_ids)
+    padded_ids = [[pad_token]*pad_len + ids for ids in all_input_ids]
+    attention_masks = [[0]*pad_len + [1]*len(ids) for ids in all_input_ids]
+    
+    # ★ 一次 forward 处理整个 batch
+    outputs = self.model(input_ids=tensor, attention_mask=mask, use_cache=True)
+    
+    # 为每个请求采样 + 保存 past_key_values
+    for i, info in enumerate(requests):
+        first_token = self._sample_token(outputs.logits[i:i+1, -1, :])
+```
+
+**采样逻辑**:
+
+```python
+def _sample_token(self, logits, temperature, top_p, top_k, do_sample):
+    if not do_sample or temperature <= 0:
+        return logits.argmax().item()  # Greedy
+    
+    logits = logits / temperature      # Temperature scaling
+    
+    if top_k > 0:                      # Top-K filtering
+        topk_vals, _ = torch.topk(logits, top_k)
+        logits[logits < topk_vals[-1]] = -inf
+    
+    if top_p < 1.0:                    # Top-P (nucleus) filtering
+        sorted_logits, sorted_idx = logits.sort(descending=True)
+        cumsum = torch.softmax(sorted_logits, -1).cumsum(-1)
+        logits[sorted_idx[cumsum > top_p]] = -inf
+    
+    probs = torch.softmax(logits, -1)
+    return torch.multinomial(probs, 1).item()
 ```
 
 ### 8.2 model_engine.py — 推理引擎
@@ -761,51 +877,7 @@ def prefill(self, request_id, input_ids, max_new_tokens, temperature, ...):
     self._handle_counter += 1
     
     # 2. 模拟 Prefill 计算延迟
-    time.sleep(0.001 * len(input_ids))  # 每 token 1ms
-    
-    # 3. 生成第一个 token (模拟)
-    first_token = self._generate_next_token(input_ids, temperature, do_sample)
-    
-    # 4. 创建 CacheEntry 并保存
-    entry = CacheEntry(handle=handle, generated_ids=list(input_ids) + [first_token])
-    entry.key_cache = [torch.randn(1, 64)]  # 模拟 KV Cache
-    self._cache[handle] = entry
-    
-    return handle, [{"id": first_token, "text": ...}], duration_ms
-```
-
-**Decode 实现**：
-
-```python
-def decode(self, request_id, cache_handle, ...):
-    # 1. 从缓存中获取 KV Cache
-    entry = self._cache[cache_handle]
-    
-    # 2. 模拟 Decode 计算延迟
-    time.sleep(0.002)  # 2ms
-    
-    # 3. 生成下一个 token
-    next_token = self._generate_next_token(entry.generated_ids, ...)
-    entry.generated_ids.append(next_token)
-    
-    # 4. 检查 EOS
-    if next_token == self.eos_token_id:
-        finish_reason = "eos_token"
-        entry.is_finished = True
-    
-    return {"id": next_token, "text": ...}, finish_reason, duration_ms
-```
-
-**模拟 token 生成**：
-
-```python
-def _generate_next_token(self, context_ids, temperature, do_sample):
-    # 基于最近 4 个 token 的 hash 生成伪随机 token
-    recent = context_ids[-4:]
-    hash_val = sum(t * (i+1) * 2654435761 for i, t in enumerate(recent))
-    token = (hash_val % (self.vocab_size - 1)) + 1
-    return token
-```
+（真实模型实现见上文 8.2 节）
 
 ### 8.3 grpc_server.py — gRPC 服务
 
@@ -857,22 +929,26 @@ server = grpc.server(
 | `ROUTER_PORT` | `3000` | HTTP 端口 |
 | `MODEL_SERVER_HOST` | `127.0.0.1` | Python 服务地址 |
 | `MODEL_SERVER_PORT` | `50051` | gRPC 端口 |
-| `MAX_CONCURRENT_REQUESTS` | `128` | 最大并发请求数 |
-| `MAX_BATCH_SIZE` | `32` | 单 batch 最大请求数 |
-| `MAX_BATCH_PREFILL_TOKENS` | `4096` | 单 batch prefill token 上限 |
-| `MAX_BATCH_TOTAL_TOKENS` | `16384` | 单 batch 总 token 上限 |
-| `MAX_WAITING_TOKENS` | `20` | 触发组 batch 的等待 token 阈值 |
+| `MAX_CONCURRENT_REQUESTS` | `64` | 最大并发请求数 |
+| `MAX_BATCH_SIZE` | `8` | 单 batch 最大请求数 (真实模型不宜过大) |
+| `MAX_BATCH_PREFILL_TOKENS` | `2048` | 单 batch prefill token 上限 |
+| `MAX_BATCH_TOTAL_TOKENS` | `8192` | 单 batch 总 token 上限 |
+| `MAX_WAITING_TOKENS` | `12` | 触发组 batch 的等待请求数阈值 |
 | `WAITING_SERVED_RATIO` | `1.2` | 延迟/吞吐平衡参数 |
-| `MAX_INPUT_LENGTH` | `4096` | 最大输入长度 |
-| `MAX_TOTAL_TOKENS` | `8192` | 单请求最大总 token 数 |
+| `MAX_INPUT_LENGTH` | `2048` | 最大输入长度 |
+| `MAX_TOTAL_TOKENS` | `4096` | 单请求最大总 token 数 |
+| `MODEL_ID` | `Qwen/Qwen2.5-1.5B-Instruct` | HuggingFace 模型 ID |
+| `DEVICE` | `cpu` | 运行设备 (cpu/cuda) |
+| `DTYPE` | `auto` | 数据类型 (auto/float16/bfloat16) |
 
 ### 9.2 调优建议
 
 | 场景 | 推荐配置 |
 |------|---------|
-| **在线聊天 (低延迟)** | `WAITING_SERVED_RATIO=1.5`, `MAX_BATCH_SIZE=4`, `MAX_CONCURRENT_REQUESTS=256` |
-| **批量处理 (高吞吐)** | `WAITING_SERVED_RATIO=0.3`, `MAX_BATCH_SIZE=32`, `MAX_BATCH_PREFILL_TOKENS=8192` |
-| **GPU 内存有限** | 减小 `MAX_BATCH_TOTAL_TOKENS`，增大 `MAX_CONCURRENT_REQUESTS` |
+| **在线聊天 (低延迟)** | `WAITING_SERVED_RATIO=1.5`, `MAX_BATCH_SIZE=2`, `MAX_CONCURRENT_REQUESTS=128` |
+| **批量处理 (高吞吐)** | `WAITING_SERVED_RATIO=0.3`, `MAX_BATCH_SIZE=8`, `MAX_BATCH_PREFILL_TOKENS=4096` |
+| **CPU 部署 (小模型)** | `MODEL_ID=Qwen2.5-1.5B`, `DEVICE=cpu`, `MAX_BATCH_SIZE=4` |
+| **GPU 部署 (大模型)** | `MODEL_ID=Qwen2.5-7B`, `DEVICE=cuda`, `DTYPE=float16`, `MAX_BATCH_SIZE=16` |
 
 ### 9.3 延迟分解
 
@@ -978,47 +1054,63 @@ curl -X POST http://localhost:3000/generate \
 4. **Tensor Parallel**：多 GPU 分片推理
 5. **量化支持**：INT8/INT4 权重压缩
 
-### 11.3 从教学版到生产版
+### 11.3 K8S 部署架构
 
 ```
-Light TGI (教学版)              →    TGI (生产版)
-─────────────────────────────────────────────────
-模拟 token 生成                 →    真实模型推理 (FlashAttention)
-简化 KV Cache                  →    PagedAttention / FlashInfer
-单线程 Python Server           →    多 GPU Tensor Parallel
-固定参数                       →    CLI 参数 + 配置文件
-无监控                         →    Prometheus metrics
-无鉴权                         →    API Key / OAuth
+                        ┌──────────────┐
+                        │  LoadBalancer │  (对外暴露 HTTP)
+                        │   / Ingress   │
+                        └──────┬───────┘
+                               │
+                    ┌──────────▼──────────┐
+                    │   Router Service    │  (ClusterIP/LoadBalancer)
+                    │   port: 80→3000     │
+                    └──────────┬──────────┘
+                               │
+               ┌───────────────┼───────────────┐
+               │               │               │
+        ┌──────▼──────┐ ┌──────▼──────┐ ┌──────▼──────┐
+        │ Router Pod  │ │ Router Pod  │ │ Router Pod  │  (HPA: 2-10)
+        │ Rust/Axum   │ │ Rust/Axum   │ │ Rust/Axum   │
+        │ CPU: 100m   │ │ CPU: 100m   │ │ CPU: 100m   │
+        └──────┬──────┘ └──────┬──────┘ └──────┬──────┘
+               │               │               │
+               └───────────────┼───────────────┘
+                               │ gRPC
+                    ┌──────────▼──────────┐
+                    │ Model Server Service │  (ClusterIP)
+                    │   port: 50051        │
+                    └──────────┬──────────┘
+                               │
+                    ┌──────────▼──────────┐
+                    │  Model Server Pod   │  (单副本, GPU 可选)
+                    │  Python/gRPC        │
+                    │  Qwen2.5-1.5B       │
+                    │  Mem: 4-8Gi         │
+                    └─────────────────────┘
 ```
 
----
+**关键 K8S 配置**:
 
-## 附录
+| 组件 | 副本数 | 资源 | 说明 |
+|------|--------|------|------|
+| Router | 2-10 (HPA) | 64Mi-256Mi mem | Rust 极低资源消耗 |
+| Model Server | 1 | 4Gi-8Gi mem | 模型加载开销大，单副本 |
+| ConfigMap | — | — | 统一管理配置 |
+| HPA | — | CPU 70% 触发 | Router 自动伸缩 |
 
-### A. 文件清单
+### 11.4 从教学版到生产版
 
 ```
-light_tgi/
-├── proto/
-│   └── generation.proto          # Protobuf 协议定义
-├── router/
-│   ├── Cargo.toml                # Rust 依赖
-│   ├── build.rs                  # Proto 编译脚本
-│   └── src/
-│       ├── main.rs               # 入口
-│       ├── config.rs             # 配置
-│       ├── server.rs             # HTTP Server
-│       ├── queue.rs              # 请求队列
-│       ├── scheduler.rs          # 调度器 (核心)
-│       └── infer.rs              # gRPC 客户端
-├── model_server/
-│   ├── pyproject.toml            # Python 依赖
-│   ├── generate_proto.py         # Proto 编译
-│   ├── grpc_server.py            # gRPC 服务
-│   ├── model_engine.py           # 推理引擎
-│   └── test_client.py            # 测试客户端
-├── test_api.py                   # HTTP API 测试
-└── DESIGN_DOC.md                 # 本文档
+Light TGI v2 (真实模型)              →    TGI (生产级)
+─────────────────────────────────────────────
+真实 HuggingFace 模型推理          →    FlashAttention 2 + vLLM
+past_key_values 复用              →    PagedAttention (vLLM)
+CPU / 单 GPU                       →    Tensor Parallel 多 GPU
+基础采样 (temperature/top_p/top_k) →    完整 sampling + beam search
+K8S Deployment + HPA              →    + Service Mesh + Canary
+无监控                             →    Prometheus + Grafana
+HTTP + SSE                         →    + WebSocket + gRPC-Web
 ```
 
 ### B. 参考资料

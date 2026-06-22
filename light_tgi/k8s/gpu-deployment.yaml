@@ -1,0 +1,215 @@
+# ============================================================
+# Light TGI GPU 部署清单 (有 GPU 节点时使用)
+#
+# 与 deployment.yaml 的区别:
+#   - Model Server 使用 GPU 资源
+#   - nodeSelector 指定 GPU 节点
+#   - 更大的资源限制
+#
+# 部署:
+#   kubectl apply -f k8s/gpu-deployment.yaml
+#
+# 前提:
+#   - 集群已安装 NVIDIA Device Plugin
+#   - 节点有 GPU 标签: accelerator=nvidia-tesla-t4
+# ============================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: light-tgi
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: light-tgi-config
+  namespace: light-tgi
+data:
+  MODEL_ID: "Qwen/Qwen2.5-7B-Instruct"
+  MAX_SEQUENCE_LENGTH: "8192"
+  MAX_BATCH_SIZE: "16"
+  RUST_LOG: "light_tgi=info"
+  MODEL_SERVER_HOST: "model-server"
+  MODEL_SERVER_PORT: "50051"
+  MAX_CONCURRENT_REQUESTS: "128"
+  MAX_BATCH_PREFILL_TOKENS: "8192"
+  MAX_BATCH_TOTAL_TOKENS: "32768"
+  MAX_INPUT_LENGTH: "4096"
+  MAX_TOTAL_TOKENS: "8192"
+  WAITING_SERVED_RATIO: "1.2"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-server
+  namespace: light-tgi
+  labels:
+    app: model-server
+spec:
+  type: ClusterIP
+  selector:
+    app: model-server
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-server
+  namespace: light-tgi
+  labels:
+    app: model-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: model-server
+  template:
+    metadata:
+      labels:
+        app: model-server
+    spec:
+      nodeSelector:
+        accelerator: nvidia-tesla-t4  # GPU 节点
+      containers:
+        - name: model-server
+          image: light-tgi-model-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 50051
+              name: grpc
+          envFrom:
+            - configMapRef:
+                name: light-tgi-config
+          env:
+            - name: DEVICE
+              value: "cuda"
+            - name: DTYPE
+              value: "float16"
+          resources:
+            requests:
+              memory: "16Gi"
+              cpu: "4"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: "32Gi"
+              cpu: "8"
+              nvidia.com/gpu: "1"
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import grpc; ch=grpc.insecure_channel('localhost:50051'); print('OK')"
+            initialDelaySeconds: 120
+            periodSeconds: 10
+            failureThreshold: 15
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import grpc; ch=grpc.insecure_channel('localhost:50051'); print('OK')"
+            initialDelaySeconds: 180
+            periodSeconds: 30
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: router
+  namespace: light-tgi
+  labels:
+    app: router
+spec:
+  type: LoadBalancer
+  selector:
+    app: router
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3000
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: router
+  namespace: light-tgi
+  labels:
+    app: router
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: router
+  template:
+    metadata:
+      labels:
+        app: router
+    spec:
+      containers:
+        - name: router
+          image: light-tgi-router:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: light-tgi-config
+          env:
+            - name: ROUTER_HOST
+              value: "0.0.0.0"
+            - name: ROUTER_PORT
+              value: "3000"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "200m"
+            limits:
+              memory: "512Mi"
+              cpu: "1"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: router-hpa
+  namespace: light-tgi
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: router
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

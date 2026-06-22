@@ -76,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
         semaphore: semaphore.clone(),
         config: config.clone(),
         scheduler: scheduler.clone(),
+        grpc_client: grpc_client.clone(),
     };
 
     let app = server::build_router(app_state);

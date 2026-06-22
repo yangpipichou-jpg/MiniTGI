@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "light-tgi-model-server"
-version = "0.1.0"
-description = "Light TGI Model Server - Python gRPC 模型推理服务 (教学项目)"
+version = "0.2.0"
+description = "Light TGI Model Server - Python gRPC 模型推理服务 (真实模型版本)"
 requires-python = ">=3.10"
 dependencies = [
     "grpcio>=1.60",
@@ -13,9 +13,15 @@ dependencies = [
     "torch>=2.0",
     "transformers>=4.36",
     "accelerate>=0.25",
+    "sentencepiece>=0.1.99",   # Qwen tokenizer 依赖
+    "tiktoken>=0.5.0",         # 某些 tokenizer 依赖
 ]
 
 [project.optional-dependencies]
 dev = [
     "grpcio-tools>=1.60",
+]
+gpu = [
+    "torch>=2.0",              # GPU 版本需手动安装
+    "flash-attn>=2.0",         # FlashAttention 加速 (可选)
 ]

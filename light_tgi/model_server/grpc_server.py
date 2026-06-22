@@ -1,13 +1,14 @@
 """
-gRPC 模型服务器
+gRPC 模型服务器 (真实模型版本)
 
 职责：
 1. 启动 gRPC 服务监听
 2. 实现 TextGenerationService 的所有 RPC 方法
-3. 将请求转发给 ModelEngine 处理
-4. 返回格式化的响应
+3. 新增 Tokenize RPC — 供 Rust Router 做输入长度验证
+4. 将请求转发给 ModelEngine (真实 HuggingFace 模型) 处理
+5. 返回格式化的响应
 
-这是 Python 端的主入口，对应 TGI 的 Model Server。
+Python 环境: F:\ProgramData\anaconda3\python.exe
 """
 
 import time
@@ -29,7 +30,7 @@ try:
     import generation_pb2_grpc as rpc
 except ImportError:
     print("错误: 未找到生成的 proto 代码。请先运行 generate_proto.py")
-    print("  python generate_proto.py")
+    print("  F:\\ProgramData\\anaconda3\\python.exe generate_proto.py")
     sys.exit(1)
 
 from model_engine import ModelEngine
@@ -58,7 +59,7 @@ class TextGenerationServicer(rpc.TextGenerationServiceServicer):
     # ================================================================
 
     def Health(self, request: pb.ModelInfoRequest, context) -> pb.ModelInfoResponse:
-        """返回模型信息"""
+        """返回模型信息 (含设备信息)"""
         logger.debug("收到 Health 请求")
         return pb.ModelInfoResponse(
             model_id=self.engine.model_id,
@@ -66,6 +67,19 @@ class TextGenerationServicer(rpc.TextGenerationServiceServicer):
             max_batch_size=self.engine.max_batch_size,
             vocab_size=self.engine.vocab_size,
             eos_token_id=self.engine.eos_token_id,
+            device=self.engine.device,
+        )
+
+    # ================================================================
+    # Tokenize - 文本转 token (供 Router 做输入长度验证)
+    # ================================================================
+
+    def Tokenize(self, request: pb.TokenizeRequest, context) -> pb.TokenizeResponse:
+        """将文本转为 token ids"""
+        token_ids, count = self.engine.tokenize(request.text)
+        return pb.TokenizeResponse(
+            token_ids=token_ids,
+            token_count=count,
         )
 
     # ================================================================
@@ -78,49 +92,48 @@ class TextGenerationServicer(rpc.TextGenerationServiceServicer):
         """
         批量预填充
 
-        对 batch 中的所有请求执行 prefill：
-        1. 处理每个请求的 input_ids
-        2. 生成首个 token
-        3. 分配 KV Cache
-        4. 返回结果
+        接收原始文本，在 Python 端做 tokenization + prefill:
+        1. Tokenize 每个请求的 input_text
+        2. Left-padding 对齐
+        3. 一次 forward 处理整个 batch
+        4. 为每个请求采样首 token
+        5. 保存 KV Cache
         """
         logger.info(
             f"收到 Prefill 请求: batch_id={request.batch_id}, "
             f"requests={len(request.requests)}"
         )
 
-        responses = []
-        total_tokens = 0
-
+        # 构建批量请求数据
+        batch_requests = []
         for req in request.requests:
-            # 提取参数
             params = req.params
-            max_new_tokens = params.max_new_tokens if params else 100
-            temperature = params.temperature if params else 1.0
-            top_p = params.top_p if params else 1.0
-            top_k = params.top_k if params else 0
-            do_sample = params.do_sample if params else False
+            batch_requests.append({
+                "request_id": req.request_id,
+                "input_text": req.input_text,
+                "params": {
+                    "max_new_tokens": params.max_new_tokens if params else 100,
+                    "temperature": params.temperature if params else 1.0,
+                    "top_p": params.top_p if params else 1.0,
+                    "top_k": params.top_k if params else 0,
+                    "do_sample": params.do_sample if params else False,
+                },
+            })
 
-            total_tokens += len(req.input_ids)
+        # 调用批量 prefill
+        results = self.engine.batch_prefill(batch_requests)
 
-            # 调用引擎
-            cache_handle, generated_tokens, duration_ms = self.engine.prefill(
-                request_id=req.request_id,
-                input_ids=list(req.input_ids),
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                do_sample=do_sample,
-            )
-
-            # 构建响应
+        # 构建响应
+        responses = []
+        for i, (cache_handle, generated_tokens, duration_ms) in enumerate(results):
             response = pb.PrefillResponse(
-                request_id=req.request_id,
+                request_id=batch_requests[i]["request_id"],
                 cache_handle=cache_handle,
                 prefill_duration_ms=duration_ms,
+                prompt_token_count=self.engine.tokenize(
+                    batch_requests[i]["input_text"]
+                )[1],
             )
-
             for token in generated_tokens:
                 response.generated_tokens.append(
                     pb.Token(
@@ -130,12 +143,11 @@ class TextGenerationServicer(rpc.TextGenerationServiceServicer):
                         special=token.get("special", False),
                     )
                 )
-
             responses.append(response)
 
         logger.info(
             f"Prefill 完成: batch_id={request.batch_id}, "
-            f"total_tokens={total_tokens}"
+            f"responses={len(responses)}"
         )
 
         return pb.BatchPrefillResponse(
@@ -150,12 +162,7 @@ class TextGenerationServicer(rpc.TextGenerationServiceServicer):
     def Decode(
         self, request: pb.BatchDecodeRequest, context
     ) -> pb.BatchDecodeResponse:
-        """
-        批量解码
-
-        对 batch 中所有活跃请求执行一次 decode step，
-        每个请求生成一个 token。
-        """
+        """批量解码: 对每个活跃请求生成一个 token"""
         logger.debug(
             f"收到 Decode 请求: batch_id={request.batch_id}, "
             f"requests={len(request.requests)}"
@@ -165,40 +172,31 @@ class TextGenerationServicer(rpc.TextGenerationServiceServicer):
 
         for req in request.requests:
             params = req.params
-            max_new_tokens = params.max_new_tokens if params else 100
-            temperature = params.temperature if params else 1.0
-            top_p = params.top_p if params else 1.0
-            top_k = params.top_k if params else 0
-            do_sample = params.do_sample if params else False
-
-            # 调用引擎
             token_dict, finish_reason, duration_ms = self.engine.decode(
                 request_id=req.request_id,
                 cache_handle=req.cache_handle,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                do_sample=do_sample,
+                max_new_tokens=params.max_new_tokens if params else 100,
+                temperature=params.temperature if params else 1.0,
+                top_p=params.top_p if params else 1.0,
+                top_k=params.top_k if params else 0,
+                do_sample=params.do_sample if params else False,
             )
 
-            # 构建响应
             response = pb.DecodeResponse(
                 request_id=req.request_id,
                 decode_duration_ms=duration_ms,
             )
 
             # 设置 finish_reason
-            if finish_reason == "eos_token":
-                response.finish_reason = pb.FinishReason.EOS_TOKEN
-            elif finish_reason == "length":
-                response.finish_reason = pb.FinishReason.MAX_TOKENS
-            elif finish_reason == "stop_sequence":
-                response.finish_reason = pb.FinishReason.STOP_SEQUENCE
-            elif finish_reason == "error":
-                response.finish_reason = pb.FinishReason.ERROR_REASON
-            else:
-                response.finish_reason = pb.FinishReason.NONE
+            reason_map = {
+                "eos_token": pb.FinishReason.EOS_TOKEN,
+                "length": pb.FinishReason.MAX_TOKENS,
+                "stop_sequence": pb.FinishReason.STOP_SEQUENCE,
+                "error": pb.FinishReason.ERROR_REASON,
+            }
+            response.finish_reason = reason_map.get(
+                finish_reason, pb.FinishReason.NONE
+            )
 
             # 设置 token
             if token_dict:
@@ -231,25 +229,38 @@ class TextGenerationServicer(rpc.TextGenerationServiceServicer):
         return pb.ClearCacheResponse(success=success)
 
 
-def serve(host: str = "0.0.0.0", port: int = 50051, max_workers: int = 10):
+def serve(
+    host: str = "0.0.0.0",
+    port: int = 50051,
+    max_workers: int = 10,
+    model_id: str = "Qwen/Qwen2.5-1.5B-Instruct",
+    device: str = "cpu",
+    dtype: str = "auto",
+):
     """启动 gRPC 服务器"""
+    logger.info("=" * 60)
+    logger.info("Light TGI Model Server (真实模型版本)")
+    logger.info("=" * 60)
 
-    # 创建模型引擎
+    # 创建模型引擎 (加载真实模型)
     engine = ModelEngine(
-        model_id=os.environ.get("MODEL_ID", "mock-gpt2"),
+        model_id=model_id,
         max_sequence_length=int(os.environ.get("MAX_SEQUENCE_LENGTH", "4096")),
-        max_batch_size=int(os.environ.get("MAX_BATCH_SIZE", "32")),
-        vocab_size=int(os.environ.get("VOCAB_SIZE", "50257")),
-        eos_token_id=int(os.environ.get("EOS_TOKEN_ID", "50256")),
-        device=os.environ.get("DEVICE", "cpu"),
+        max_batch_size=int(os.environ.get("MAX_BATCH_SIZE", "8")),
+        device=device,
+        dtype=dtype,
     )
 
     # 创建 gRPC 服务器
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=max_workers),
         options=[
-            ("grpc.max_send_message_length", 100 * 1024 * 1024),  # 100MB
+            ("grpc.max_send_message_length", 100 * 1024 * 1024),
             ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+            ("grpc.keepalive_time_ms", 30000),
+            ("grpc.keepalive_timeout_ms", 10000),
+            ("grpc.http2.min_time_between_pings_ms", 10000),
+            ("grpc.http2.max_pings_without_data", 0),
         ],
     )
 
@@ -263,7 +274,6 @@ def serve(host: str = "0.0.0.0", port: int = 50051, max_workers: int = 10):
 
     # 启动
     server.start()
-    logger.info(f"=== Light TGI Model Server 启动 ===")
     logger.info(f"监听地址: {addr}")
     logger.info(f"模型: {engine.model_id}")
     logger.info(f"设备: {engine.device}")
@@ -282,6 +292,28 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="0.0.0.0", help="监听地址")
     parser.add_argument("--port", type=int, default=50051, help="监听端口")
     parser.add_argument("--workers", type=int, default=10, help="工作线程数")
+    parser.add_argument(
+        "--model-id",
+        default=os.environ.get("MODEL_ID", "Qwen/Qwen2.5-1.5B-Instruct"),
+        help="HuggingFace 模型 ID",
+    )
+    parser.add_argument(
+        "--device",
+        default=os.environ.get("DEVICE", "cpu"),
+        help="运行设备 (cpu / cuda / cuda:0)",
+    )
+    parser.add_argument(
+        "--dtype",
+        default=os.environ.get("DTYPE", "auto"),
+        help="数据类型 (auto / float16 / bfloat16)",
+    )
     args = parser.parse_args()
 
-    serve(host=args.host, port=args.port, max_workers=args.workers)
+    serve(
+        host=args.host,
+        port=args.port,
+        max_workers=args.workers,
+        model_id=args.model_id,
+        device=args.device,
+        dtype=args.dtype,
+    )

@@ -1,22 +1,27 @@
 """
-使用 curl 测试 Router 的 HTTP API
+Light TGI HTTP API 测试 (真实模型版本)
 
-前置条件：
-1. Python Model Server 已启动: python model_server/grpc_server.py
-2. Rust Router 已编译启动: cargo run --release
+前置条件:
+1. Python Model Server 已启动: start_model_server.bat
+2. Rust Router 已编译启动: start_router.bat
+
+用法:
+    F:\ProgramData\anaconda3\python.exe test_api.py
+    F:\ProgramData\anaconda3\python.exe test_api.py --concurrent
 """
 
 import requests
 import json
 import sys
+import time
 
 
 def test_generate(host="localhost", port=3000):
-    """测试 /generate 端点"""
+    """测试 /generate 端点 (SSE 流式输出)"""
     url = f"http://{host}:{port}/generate"
 
     payload = {
-        "inputs": "What is the capital of France?",
+        "inputs": "What is the capital of France? Answer briefly.",
         "parameters": {
             "max_new_tokens": 50,
             "temperature": 0.7,
@@ -24,48 +29,47 @@ def test_generate(host="localhost", port=3000):
         },
     }
 
-    print(f"发送请求到 {url}")
-    print(f"Payload: {json.dumps(payload, indent=2)}")
+    print(f"POST {url}")
+    print(f"Input: {payload['inputs']}")
     print("-" * 60)
 
     try:
-        # 使用 stream=True 接收 SSE
+        start = time.time()
         response = requests.post(
             url,
             json=payload,
             headers={"Content-Type": "application/json"},
             stream=True,
-            timeout=30,
+            timeout=60,
         )
 
-        print(f"状态码: {response.status_code}")
-        print(f"响应头: {dict(response.headers)}")
+        print(f"Status: {response.status_code}")
         print("-" * 60)
-        print("SSE 流式响应:")
+        print("Output: ", end="", flush=True)
 
         for line in response.iter_lines(decode_unicode=True):
-            if line:
-                if line.startswith("data: "):
-                    data_str = line[6:]  # 去掉 "data: " 前缀
-                    try:
-                        data = json.loads(data_str)
-                        token = data.get("token", {})
-                        text = token.get("text", "")
-                        generated = data.get("generated_text", "")
-                        details = data.get("details")
+            if line and line.startswith("data: "):
+                data_str = line[6:]
+                try:
+                    data = json.loads(data_str)
+                    token = data.get("token", {})
+                    text = token.get("text", "")
+                    details = data.get("details")
 
-                        if details:
-                            print(f"\n[完成] {details}")
-                        else:
-                            print(text, end="", flush=True)
-                    except json.JSONDecodeError:
-                        print(f"\n[原始数据] {data_str}")
+                    if details:
+                        elapsed = time.time() - start
+                        print(f"\n\n[完成] {details['finish_reason']}")
+                        print(f"生成 {details['generated_tokens']} tokens")
+                        print(f"总耗时: {elapsed:.2f}s")
+                    else:
+                        print(text, end="", flush=True)
+                except json.JSONDecodeError:
+                    pass
 
         print("\n" + "-" * 60)
-        print("请求完成!")
 
     except requests.exceptions.ConnectionError:
-        print(f"错误: 无法连接到 {url}，请确保 Router 已启动")
+        print(f"错误: 无法连接 {url}，请确保 Router 已启动")
         sys.exit(1)
     except requests.exceptions.Timeout:
         print("错误: 请求超时")
@@ -76,31 +80,48 @@ def test_generate(host="localhost", port=3000):
 
 
 def test_concurrent():
-    """测试并发请求和过载保护"""
+    """并发测试"""
     import concurrent.futures
 
-    url = f"http://localhost:3000/generate"
+    url = "http://localhost:3000/generate"
 
-    def send_request(i):
+    prompts = [
+        "What is Python?",
+        "Explain machine learning in one sentence.",
+        "What is the capital of China?",
+        "Who wrote Romeo and Juliet?",
+    ]
+
+    def send_request(i, prompt):
         payload = {
-            "inputs": f"Request number {i}",
-            "parameters": {"max_new_tokens": 20},
+            "inputs": prompt,
+            "parameters": {"max_new_tokens": 30, "temperature": 0.7},
         }
         try:
-            resp = requests.post(url, json=payload, timeout=10)
-            return i, resp.status_code
+            start = time.time()
+            resp = requests.post(url, json=payload, timeout=30, stream=True)
+            tokens = []
+            for line in resp.iter_lines(decode_unicode=True):
+                if line and line.startswith("data: "):
+                    data = json.loads(line[6:])
+                    t = data.get("token", {}).get("text", "")
+                    tokens.append(t)
+            elapsed = time.time() - start
+            return i, resp.status_code, "".join(tokens), elapsed
         except Exception as e:
-            return i, str(e)
+            return i, 0, str(e), 0
 
     print("=" * 60)
-    print("并发测试: 发送 20 个并发请求")
+    print(f"并发测试: {len(prompts)} 个请求")
     print("=" * 60)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        futures = [executor.submit(send_request, i) for i in range(20)]
-        for future in concurrent.futures.as_completed(futures):
-            i, result = future.result()
-            print(f"  请求 #{i}: {result}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompts)) as ex:
+        futures = [ex.submit(send_request, i, p) for i, p in enumerate(prompts)]
+        for f in concurrent.futures.as_completed(futures):
+            i, status, text, elapsed = f.result()
+            print(f"  #{i}: status={status}, time={elapsed:.2f}s")
+            if text and len(text) < 200:
+                print(f"       output: {text.strip()[:100]}...")
 
 
 if __name__ == "__main__":
@@ -108,7 +129,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=3000)
-    parser.add_argument("--concurrent", action="store_true", help="并发测试")
+    parser.add_argument("--concurrent", action="store_true")
     args = parser.parse_args()
 
     if args.concurrent:

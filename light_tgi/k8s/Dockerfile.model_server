@@ -1,0 +1,65 @@
+# ============================================================
+# Light TGI Model Server Dockerfile (Python gRPC 服务)
+#
+# 构建:
+#   docker build -f k8s/Dockerfile.model_server -t light-tgi-model-server:latest .
+#
+# 运行:
+#   docker run -p 50051:50051 light-tgi-model-server:latest
+# ============================================================
+
+FROM python:3.11-slim
+
+LABEL component="light-tgi-model-server"
+LABEL description="Light TGI Python Model Server - Real HuggingFace Model Inference"
+
+# 设置工作目录
+WORKDIR /app
+
+# 安装系统依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 Python 依赖
+COPY model_server/pyproject.toml /app/
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+    grpcio>=1.60 \
+    protobuf>=4.25 \
+    torch>=2.0 \
+    transformers>=4.36 \
+    accelerate>=0.25 \
+    grpcio-tools>=1.60
+
+# 复制源代码
+COPY proto/ /app/proto/
+COPY model_server/ /app/model_server/
+
+# 编译 proto
+RUN cd /app/model_server && python generate_proto.py
+
+# 创建模型缓存目录 (挂载 volume 或下载到容器内)
+RUN mkdir -p /app/models
+
+# 环境变量
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app/model_server
+ENV MODEL_ID=Qwen/Qwen2.5-1.5B-Instruct
+ENV DEVICE=cpu
+ENV MAX_BATCH_SIZE=8
+ENV MAX_SEQUENCE_LENGTH=4096
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD python -c "import grpc; ch=grpc.insecure_channel('localhost:50051'); print('OK')" || exit 1
+
+# 暴露 gRPC 端口
+EXPOSE 50051
+
+# 启动命令
+CMD ["python", "/app/model_server/grpc_server.py", \
+     "--host", "0.0.0.0", \
+     "--port", "50051", \
+     "--workers", "4"]

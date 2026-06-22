@@ -45,14 +45,14 @@ impl Default for RouterConfig {
             router_port: 3000,
             model_server_host: "127.0.0.1".into(),
             model_server_port: 50051,
-            max_concurrent_requests: 128,
-            max_batch_size: 32,
-            max_batch_prefill_tokens: 4096,
-            max_batch_total_tokens: 16384,
-            max_waiting_tokens: 20,
+            max_concurrent_requests: 64,       // 真实模型并发不宜过高
+            max_batch_size: 8,                  // 小模型 batch size
+            max_batch_prefill_tokens: 2048,
+            max_batch_total_tokens: 8192,
+            max_waiting_tokens: 12,
             waiting_served_ratio: 1.2,
-            max_input_length: 4096,
-            max_total_tokens: 8192,
+            max_input_length: 2048,
+            max_total_tokens: 4096,
         }
     }
 }

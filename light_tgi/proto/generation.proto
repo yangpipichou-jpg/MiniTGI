@@ -3,28 +3,32 @@ syntax = "proto3";
 package light_tgi;
 
 // ============================================================
-// Light TGI - gRPC 协议定义
-// 定义 Router (Rust) 与 Model Server (Python) 之间的通信协议
+// Light TGI - gRPC 协议定义 (v2: 真实模型版本)
+//
+// 架构变更:
+//   - Router 不再做 tokenization，只传原始文本
+//   - Python Server 负责 tokenization + 模型推理
+//   - 新增 Tokenize RPC 用于 Router 端做长度验证
 // ============================================================
 
 // ---------- 基本类型 ----------
 
 // 请求状态
 enum RequestStatus {
-  WAITING = 0;    // 等待调度
-  PREFILL = 1;    // 预填充阶段（处理 prompt，生成第一个 token）
-  DECODE = 2;     // 解码阶段（逐个生成后续 token）
-  FINISHED = 3;   // 已完成
-  ERROR = 4;      // 出错
+  WAITING = 0;
+  PREFILL = 1;
+  DECODE = 2;
+  FINISHED = 3;
+  ERROR = 4;
 }
 
 // 停止原因
 enum FinishReason {
   NONE = 0;
-  EOS_TOKEN = 1;       // 遇到结束符
-  MAX_TOKENS = 2;      // 达到 max_new_tokens
-  STOP_SEQUENCE = 3;   // 遇到停止序列
-  ERROR_REASON = 4;    // 发生错误
+  EOS_TOKEN = 1;
+  MAX_TOKENS = 2;
+  STOP_SEQUENCE = 3;
+  ERROR_REASON = 4;
 }
 
 // 单个 token 信息
@@ -39,39 +43,40 @@ message Token {
 
 // 生成参数
 message GenerationParameters {
-  int32 max_new_tokens = 1;      // 最大生成 token 数
-  float temperature = 2;         // 温度 (0.0 ~ 2.0)
-  float top_p = 3;               // nucleus sampling
-  int32 top_k = 4;               // top-k sampling
-  float repetition_penalty = 5;  // 重复惩罚
-  repeated int32 stop_token_ids = 6;  // 停止 token id 列表
-  repeated string stop_strings = 7;   // 停止字符串列表
-  int32 seed = 8;                // 随机种子
-  bool do_sample = 9;            // 是否采样 (false = greedy)
+  int32 max_new_tokens = 1;
+  float temperature = 2;
+  float top_p = 3;
+  int32 top_k = 4;
+  float repetition_penalty = 5;
+  repeated int32 stop_token_ids = 6;
+  repeated string stop_strings = 7;
+  int32 seed = 8;
+  bool do_sample = 9;
 }
 
-// Prefill 请求 (Rust Router -> Python Server)
+// Prefill 请求: 发送原始文本，Python 端做 tokenization
 message PrefillRequest {
-  string request_id = 1;                 // 请求唯一 ID
-  repeated int32 input_ids = 2;          // 输入的 token id 列表
-  GenerationParameters params = 3;       // 生成参数
-  repeated int32 slot_ids = 4;           // KV cache slot 分配
-  int32 batch_id = 5;                    // batch 内索引
+  string request_id = 1;
+  string input_text = 2;               // ★ 原始文本 (不再传 token ids)
+  GenerationParameters params = 3;
+  repeated int32 slot_ids = 4;
+  int32 batch_id = 5;
 }
 
 // Prefill 响应
 message PrefillResponse {
   string request_id = 1;
-  repeated Token generated_tokens = 2;   // 预填充生成的 tokens (含第一个新 token)
-  int64 cache_handle = 3;                // KV cache 句柄，后续 decode 使用
-  int32 prefill_duration_ms = 4;         // 预填充耗时 (ms)
+  repeated Token generated_tokens = 2;
+  int64 cache_handle = 3;
+  int32 prefill_duration_ms = 4;
+  int32 prompt_token_count = 5;        // ★ 新增: prompt 的 token 数
 }
 
-// Decode 请求 (Rust Router -> Python Server)
+// Decode 请求
 message DecodeRequest {
   string request_id = 1;
-  int32 token_id = 2;                    // 上一步生成的 token id
-  int64 cache_handle = 3;                // KV cache 句柄
+  int32 token_id = 2;
+  int64 cache_handle = 3;
   GenerationParameters params = 4;
 }
 
@@ -85,64 +90,75 @@ message DecodeResponse {
 
 // ---------- 批量接口 ----------
 
-// 批量 Prefill 请求
 message BatchPrefillRequest {
   int64 batch_id = 1;
   repeated PrefillRequest requests = 2;
 }
 
-// 批量 Prefill 响应
 message BatchPrefillResponse {
   int64 batch_id = 1;
   repeated PrefillResponse responses = 2;
 }
 
-// 批量 Decode 请求
 message BatchDecodeRequest {
   int64 batch_id = 1;
   repeated DecodeRequest requests = 2;
 }
 
-// 批量 Decode 响应
 message BatchDecodeResponse {
   int64 batch_id = 1;
   repeated DecodeResponse responses = 2;
 }
 
-// 模型信息请求
+// ---------- Tokenize 接口 (供 Router 做输入长度验证) ----------
+
+message TokenizeRequest {
+  string text = 1;
+}
+
+message TokenizeResponse {
+  repeated int32 token_ids = 1;
+  int32 token_count = 2;
+}
+
+// ---------- 模型信息 ----------
+
 message ModelInfoRequest {}
 
-// 模型信息响应
 message ModelInfoResponse {
   string model_id = 1;
   int32 max_sequence_length = 2;
   int32 max_batch_size = 3;
   int32 vocab_size = 4;
   int32 eos_token_id = 5;
+  string device = 6;                   // ★ 新增: 运行设备
+}
+
+// ---------- 清理缓存 ----------
+
+message ClearCacheRequest {
+  repeated int64 cache_handles = 1;
+}
+
+message ClearCacheResponse {
+  bool success = 1;
 }
 
 // ---------- gRPC 服务定义 ----------
 
 service TextGenerationService {
-  // 健康检查
+  // 健康检查 / 模型信息
   rpc Health (ModelInfoRequest) returns (ModelInfoResponse);
 
-  // 批量预填充：处理整个 batch 的 prompt，生成首 token
+  // Tokenize: 文本 → token ids (供 Router 做输入长度验证)
+  rpc Tokenize (TokenizeRequest) returns (TokenizeResponse);
+
+  // 批量预填充: 处理整个 batch 的 prompt，生成首 token
   rpc Prefill (BatchPrefillRequest) returns (BatchPrefillResponse);
 
-  // 批量解码：对 batch 中所有请求逐个生成下一个 token
+  // 批量解码: 对 batch 中所有请求逐个生成下一个 token
   rpc Decode (BatchDecodeRequest) returns (BatchDecodeResponse);
 
   // 清理 KV cache 资源
   rpc ClearCache (ClearCacheRequest) returns (ClearCacheResponse);
-}
-
-// 清理缓存请求
-message ClearCacheRequest {
-  repeated int64 cache_handles = 1;
-}
-
-// 清理缓存响应
-message ClearCacheResponse {
-  bool success = 1;
 }

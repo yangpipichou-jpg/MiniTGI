@@ -1,0 +1,68 @@
+# ============================================================
+# Light TGI Router Dockerfile (Rust HTTP + gRPC 调度器)
+#
+# 使用多阶段构建，最终镜像极小 (~15MB)
+#
+# 构建:
+#   docker build -f k8s/Dockerfile.router -t light-tgi-router:latest .
+# ============================================================
+
+# ---- Stage 1: 编译 Rust ----
+FROM rust:1.78-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    protobuf-compiler \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 先复制依赖清单，利用 Docker 缓存
+COPY router/Cargo.toml router/Cargo.lock* /app/router/
+COPY router/build.rs /app/router/
+COPY proto/ /app/proto/
+
+# 创建空 src 让 cargo 下载依赖 (Docker 层缓存优化)
+RUN mkdir -p /app/router/src && \
+    echo 'fn main() {}' > /app/router/src/main.rs
+
+WORKDIR /app/router
+RUN cargo build --release 2>/dev/null || true
+
+# 复制真实源码
+COPY router/src/ /app/router/src/
+RUN touch src/main.rs && cargo build --release
+
+# ---- Stage 2: 运行镜像 ----
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 从 builder 复制编译产物
+COPY --from=builder /app/router/target/release/light-tgi-router /app/light-tgi-router
+
+# 创建非 root 用户
+RUN useradd --no-create-home --shell /bin/false tgi && \
+    chown -R tgi:tgi /app
+
+USER tgi
+
+# 环境变量
+ENV RUST_LOG=light_tgi=info
+ENV ROUTER_HOST=0.0.0.0
+ENV ROUTER_PORT=3000
+ENV MODEL_SERVER_HOST=model-server
+ENV MODEL_SERVER_PORT=50051
+
+# 健康检查
+HEALTHCHECK --interval=15s --timeout=5s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:3000/health || exit 1
+
+EXPOSE 3000
+
+CMD ["/app/light-tgi-router"]
