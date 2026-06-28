@@ -1,15 +1,21 @@
-//! Light TGI Router - 入口文件
+//! Light TGI Router - 入口文件 (事件驱动架构 v3)
 //!
-//! 职责：
-//! 1. 初始化配置和日志
-//! 2. 创建 gRPC 客户端连接到 Python Model Server
-//! 3. 启动 HTTP Server 和后台 Batching Task
-//! 4. 优雅关闭
+//! 架构升级变更:
+//!   旧: server → queue(mpsc) → scheduler(同步阻塞) → grpc
+//!   新: server → EventBus → Scheduler Actor → Session Actor → grpc (异步流)
+//!
+//! 启动流程:
+//!   1. 初始化 EventBus (全局消息中枢)
+//!   2. 连接 gRPC (Python Model Server)
+//!   3. 启动 Scheduler Actor (tokio::spawn)
+//!   4. 启动 HTTP Server (Axum)
 
 mod server;
 mod scheduler;
+mod session;
 mod queue;
 mod infer;
+mod event_bus;
 mod config;
 
 use std::sync::Arc;
@@ -17,9 +23,9 @@ use tokio::sync::Semaphore;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::RouterConfig;
+use crate::event_bus::EventBus;
 use crate::infer::GrpcClient;
-use crate::queue::RequestQueue;
-use crate::scheduler::BatchingScheduler;
+use crate::scheduler::SchedulerActor;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -31,51 +37,54 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!("=== Light TGI Router 启动中 ===");
+    tracing::info!("=== Light TGI Router v3 (事件驱动架构) 启动中 ===");
 
     // 加载配置
     let config = RouterConfig::from_env()?;
     tracing::info!("配置: {:#?}", config);
 
-    // 1. 创建 gRPC 客户端连接 Python Model Server
+    // 1. 连接 Python Model Server
     let grpc_addr = format!("http://{}:{}", config.model_server_host, config.model_server_port);
     tracing::info!("连接 Model Server: {}", grpc_addr);
     let grpc_client = GrpcClient::connect(&grpc_addr).await?;
 
     // 获取模型信息
-    let model_info = grpc_client.get_model_info().await?;
-    tracing::info!(
-        "模型信息: id={}, max_seq_len={}, vocab_size={}",
-        model_info.model_id,
-        model_info.max_sequence_length,
-        model_info.vocab_size
-    );
+    match grpc_client.get_model_info().await {
+        Ok(info) => {
+            tracing::info!(
+                "模型信息: id={}, max_seq_len={}, vocab_size={}, device={}",
+                info.model_id, info.max_sequence_length, info.vocab_size, info.device
+            );
+        }
+        Err(e) => {
+            tracing::warn!("获取模型信息失败: {}，继续启动...", e);
+        }
+    }
 
-    // 2. 创建请求队列 (无界通道)
-    let queue = Arc::new(RequestQueue::new());
+    // 2. ★ 创建 EventBus (全局消息中枢)
+    let event_bus = EventBus::new();
 
-    // 3. 创建并发控制信号量 (过载保护)
-    let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
-
-    // 4. 创建调度器
-    let scheduler = Arc::new(BatchingScheduler::new(
+    // 3. ★ 创建 Scheduler Actor
+    let scheduler = SchedulerActor::new(
         config.clone(),
         grpc_client.clone(),
-        queue.clone(),
-    ));
+        event_bus.clone(),
+    );
 
-    // 5. 启动后台批处理任务 (spawn 一个永不结束的 tokio task)
-    let scheduler_clone = scheduler.clone();
+    // 4. ★ spawn Scheduler Actor (异步、独立运行)
     tokio::spawn(async move {
-        scheduler_clone.run().await;
+        scheduler.run().await;
     });
+    tracing::info!("Scheduler Actor 已启动");
+
+    // 5. 创建并发控制信号量 (过载保护)
+    let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
 
     // 6. 构建 HTTP 路由并启动
     let app_state = server::AppState {
-        queue: queue.clone(),
+        event_bus: event_bus.clone(),
         semaphore: semaphore.clone(),
         config: config.clone(),
-        scheduler: scheduler.clone(),
         grpc_client: grpc_client.clone(),
     };
 

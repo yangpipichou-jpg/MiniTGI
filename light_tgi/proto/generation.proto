@@ -3,17 +3,16 @@ syntax = "proto3";
 package light_tgi;
 
 // ============================================================
-// Light TGI - gRPC 协议定义 (v2: 真实模型版本)
+// Light TGI - gRPC 协议定义 (v3: 事件驱动架构)
 //
 // 架构变更:
-//   - Router 不再做 tokenization，只传原始文本
-//   - Python Server 负责 tokenization + 模型推理
-//   - 新增 Tokenize RPC 用于 Router 端做长度验证
+//   - 新增 StreamGenerate RPC: 异步流式推理 (双向流)
+//   - 保留批量接口兼容旧逻辑
+//   - Router 不做 tokenization，传原始文本
 // ============================================================
 
 // ---------- 基本类型 ----------
 
-// 请求状态
 enum RequestStatus {
   WAITING = 0;
   PREFILL = 1;
@@ -22,7 +21,6 @@ enum RequestStatus {
   ERROR = 4;
 }
 
-// 停止原因
 enum FinishReason {
   NONE = 0;
   EOS_TOKEN = 1;
@@ -31,7 +29,6 @@ enum FinishReason {
   ERROR_REASON = 4;
 }
 
-// 单个 token 信息
 message Token {
   int32 id = 1;
   string text = 2;
@@ -41,7 +38,6 @@ message Token {
 
 // ---------- 请求/响应 ----------
 
-// 生成参数
 message GenerationParameters {
   int32 max_new_tokens = 1;
   float temperature = 2;
@@ -54,25 +50,24 @@ message GenerationParameters {
   bool do_sample = 9;
 }
 
-// Prefill 请求: 发送原始文本，Python 端做 tokenization
+// Prefill: 发送原始文本
 message PrefillRequest {
   string request_id = 1;
-  string input_text = 2;               // ★ 原始文本 (不再传 token ids)
+  string input_text = 2;
   GenerationParameters params = 3;
   repeated int32 slot_ids = 4;
   int32 batch_id = 5;
 }
 
-// Prefill 响应
 message PrefillResponse {
   string request_id = 1;
   repeated Token generated_tokens = 2;
   int64 cache_handle = 3;
   int32 prefill_duration_ms = 4;
-  int32 prompt_token_count = 5;        // ★ 新增: prompt 的 token 数
+  int32 prompt_token_count = 5;
 }
 
-// Decode 请求
+// Decode
 message DecodeRequest {
   string request_id = 1;
   int32 token_id = 2;
@@ -80,7 +75,6 @@ message DecodeRequest {
   GenerationParameters params = 4;
 }
 
-// Decode 响应
 message DecodeResponse {
   string request_id = 1;
   Token generated_token = 2;
@@ -88,7 +82,26 @@ message DecodeResponse {
   int32 decode_duration_ms = 4;
 }
 
-// ---------- 批量接口 ----------
+// ---------- ★ 异步流式推理 (事件驱动架构核心) ----------
+
+/// Session 向 Python 发送的请求 (一次完整的生成流程)
+message StreamGenerateRequest {
+  string request_id = 1;
+  string input_text = 2;
+  GenerationParameters params = 3;
+}
+
+/// Python 向 Session 流式返回的 token
+message StreamGenerateResponse {
+  string request_id = 1;
+  Token generated_token = 2;
+  FinishReason finish_reason = 3;
+  int32 step = 4;                    // 当前步数 (prefill=0, decode=1,2,...)
+  int32 duration_ms = 5;             // 本步耗时
+  int64 cache_handle = 6;            // KV cache 句柄 (prefill 步返回)
+}
+
+// ---------- 批量接口 (保留) ----------
 
 message BatchPrefillRequest {
   int64 batch_id = 1;
@@ -110,7 +123,7 @@ message BatchDecodeResponse {
   repeated DecodeResponse responses = 2;
 }
 
-// ---------- Tokenize 接口 (供 Router 做输入长度验证) ----------
+// ---------- Tokenize ----------
 
 message TokenizeRequest {
   string text = 1;
@@ -131,7 +144,7 @@ message ModelInfoResponse {
   int32 max_batch_size = 3;
   int32 vocab_size = 4;
   int32 eos_token_id = 5;
-  string device = 6;                   // ★ 新增: 运行设备
+  string device = 6;
 }
 
 // ---------- 清理缓存 ----------
@@ -150,15 +163,20 @@ service TextGenerationService {
   // 健康检查 / 模型信息
   rpc Health (ModelInfoRequest) returns (ModelInfoResponse);
 
-  // Tokenize: 文本 → token ids (供 Router 做输入长度验证)
+  // Tokenize: 文本 → token ids
   rpc Tokenize (TokenizeRequest) returns (TokenizeResponse);
 
-  // 批量预填充: 处理整个 batch 的 prompt，生成首 token
+  // ★ 异步流式生成 (事件驱动架构核心)
+  //   Session 发送一次请求, Python 持续流式返回 token
+  //   替代原来的 Prefill → Decode 循环
+  rpc StreamGenerate (StreamGenerateRequest) returns (stream StreamGenerateResponse);
+
+  // 批量预填充 (保留, 兼容旧逻辑)
   rpc Prefill (BatchPrefillRequest) returns (BatchPrefillResponse);
 
-  // 批量解码: 对 batch 中所有请求逐个生成下一个 token
+  // 批量解码 (保留, 兼容旧逻辑)
   rpc Decode (BatchDecodeRequest) returns (BatchDecodeResponse);
 
-  // 清理 KV cache 资源
+  // 清理 KV cache
   rpc ClearCache (ClearCacheRequest) returns (ClearCacheResponse);
 }

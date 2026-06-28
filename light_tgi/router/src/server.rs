@@ -1,9 +1,9 @@
-//! HTTP Server 模块 (真实模型版本)
+//! HTTP Server 模块 (事件驱动版本)
 //!
-//! 变更:
-//!   - Router 不再做 tokenization，传原始文本给 Python Server
-//!   - 使用 gRPC Tokenize RPC 做输入长度验证
-//!   - 保留过载保护和 SSE 流式输出
+//! 架构升级核心变更:
+//!   旧: HTTP handler 直接入队到 RequestQueue → Scheduler 轮询消费
+//!   新: HTTP handler 发布 NewRequestEvent 到 EventBus → Scheduler 订阅消费
+//!   SSE stream 通过 EventBus 订阅 token 事件 (而不是独占的 mpsc channel)
 
 use std::sync::Arc;
 use axum::{
@@ -13,7 +13,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
     },
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use futures::stream::Stream;
@@ -23,17 +23,18 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::config::RouterConfig;
+use crate::event_bus::{EventBus, NewRequestEvent, QueueToken};
 use crate::infer::GrpcClient;
-use crate::queue::{QueueEntry, QueueToken, RequestQueue};
-use crate::scheduler::BatchingScheduler;
 
-/// 应用共享状态
+// ============================================================
+// 应用共享状态
+// ============================================================
+
 #[derive(Clone)]
 pub struct AppState {
-    pub queue: Arc<RequestQueue>,
+    pub event_bus: EventBus,
     pub semaphore: Arc<Semaphore>,
     pub config: RouterConfig,
-    pub scheduler: Arc<BatchingScheduler>,
     pub grpc_client: GrpcClient,
 }
 
@@ -41,7 +42,6 @@ pub struct AppState {
 // HTTP 请求/响应类型
 // ============================================================
 
-/// POST /generate 请求体 (兼容 TGI API 格式)
 #[derive(Debug, Deserialize)]
 pub struct GenerateRequest {
     pub inputs: String,
@@ -97,7 +97,7 @@ pub struct ErrorResponse {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/generate", post(generate_handler))
-        .route("/health", axum::routing::get(health_handler))
+        .route("/health", get(health_handler))
         .with_state(state)
 }
 
@@ -109,14 +109,14 @@ async fn health_handler() -> &'static str {
     "OK"
 }
 
-/// 核心: POST /generate
+/// 核心: POST /generate — 事件驱动版本
 async fn generate_handler(
     State(state): State<AppState>,
     Json(payload): Json<GenerateRequest>,
 ) -> impl IntoResponse {
     let queue_time = chrono::Utc::now();
 
-    // ---- 1. 请求验证 (使用 gRPC Tokenize 做真实 token 计数) ----
+    // ---- 1. 请求验证 ----
     let validation = validate_request(&payload, &state).await;
     if let Err(err) = validation {
         return err;
@@ -137,26 +137,28 @@ async fn generate_handler(
         }
     };
 
-    // ---- 3. 创建响应通道 ----
-    let (response_tx, response_rx) = mpsc::unbounded_channel();
+    // ---- 3. 创建 SSE 流 (通过 EventBus 订阅 token 事件) ----
     let request_id = uuid::Uuid::new_v4().to_string();
 
-    // ---- 4. 入队 (传递原始文本) ----
-    let entry = QueueEntry {
+    // ★ 订阅 token 事件 (全局 broadcast, 按 request_id 过滤)
+    let mut token_rx = state.event_bus.subscribe_token();
+
+    // ★ 发布新请求事件到 EventBus → Scheduler 会收到
+    let event = NewRequestEvent {
         request_id: request_id.clone(),
-        input_text: input_text,    // ★ 原始文本
+        input_text,
         max_new_tokens: params.max_new_tokens,
         temperature: params.temperature,
         top_p: params.top_p,
         top_k: params.top_k,
         do_sample: params.do_sample,
-        response_tx,
+        response_tx: mpsc::unbounded_channel().0, // 不再使用, 通过 EventBus
         queue_time,
     };
-    state.queue.enqueue(entry);
+    state.event_bus.publish_new_request(event);
 
-    // ---- 5. 返回 SSE 流 ----
-    let stream = build_sse_stream(request_id, response_rx, permit, queue_time);
+    // ---- 4. 返回 SSE 流 ----
+    let stream = build_sse_stream(request_id, token_rx, permit, queue_time);
 
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
@@ -164,14 +166,13 @@ async fn generate_handler(
 }
 
 // ============================================================
-// 请求验证 (使用 gRPC Tokenize)
+// 请求验证
 // ============================================================
 
 async fn validate_request(
     req: &GenerateRequest,
     state: &AppState,
 ) -> Result<(ValidatedParams, String), axum::response::Response> {
-    // 检查输入非空
     let input_text = req.inputs.trim().to_string();
     if input_text.is_empty() {
         return Err((
@@ -183,31 +184,25 @@ async fn validate_request(
         ).into_response());
     }
 
-    // ★ 使用 gRPC Tokenize 获取真实 token 数
+    // gRPC Tokenize 获取真实 token 数
     let token_count = match state.grpc_client.tokenize(&input_text).await {
         Ok(count) => count,
         Err(e) => {
-            tracing::warn!("Tokenize 失败: {}，跳过长度验证", e);
-            // 如果 tokenize 失败，允许请求通过 (稍后在 Python 端会再次验证)
-            input_text.len() / 4  // 粗略估计: 英文约 4 字符/token
+            tracing::warn!("Tokenize 失败: {}，使用估算", e);
+            input_text.len() / 4
         }
     };
 
-    // 检查输入长度
     if token_count > state.config.max_input_length {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(ErrorResponse {
-                error: format!(
-                    "输入过长: {} tokens (最大: {})",
-                    token_count, state.config.max_input_length
-                ),
+                error: format!("输入过长: {} tokens (最大: {})", token_count, state.config.max_input_length),
                 error_type: "validation_error".into(),
             }),
         ).into_response());
     }
 
-    // 参数校验
     let max_new_tokens = req.parameters.max_new_tokens.unwrap_or(100).min(2048);
     let temperature = req.parameters.temperature.unwrap_or(1.0);
     if !(0.0..=2.0).contains(&temperature) {
@@ -224,11 +219,7 @@ async fn validate_request(
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(ErrorResponse {
-                error: format!(
-                    "总 token 数超限: {} (最大: {})",
-                    token_count + max_new_tokens as usize,
-                    state.config.max_total_tokens
-                ),
+                error: format!("总 token 数超限: {} (最大: {})", token_count + max_new_tokens as usize, state.config.max_total_tokens),
                 error_type: "validation_error".into(),
             }),
         ).into_response());
@@ -256,43 +247,65 @@ struct ValidatedParams {
     do_sample: bool,
 }
 
-/// 构建 SSE 流
+/// 构建 SSE 流 — 从 EventBus 订阅 token 事件, 按 request_id 过滤
 fn build_sse_stream(
-    _request_id: String,
-    response_rx: mpsc::UnboundedReceiver<QueueToken>,
+    request_id: String,
+    mut token_rx: tokio::sync::broadcast::Receiver<QueueToken>,
     _permit: tokio::sync::OwnedSemaphorePermit,
     queue_time: chrono::DateTime<chrono::Utc>,
 ) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
-    let stream = UnboundedReceiverStream::new(response_rx);
     let mut generated_text = String::new();
     let mut token_count: u32 = 0;
 
-    stream.map(move |token| {
-        token_count += 1;
-        generated_text.push_str(&token.token_text);
+    async_stream::stream! {
+        loop {
+            match token_rx.recv().await {
+                Ok(token) => {
+                    // ★ 只处理属于当前请求的 token
+                    if token.request_id != request_id {
+                        continue;
+                    }
 
-        let response = GenerateStreamResponse {
-            token: TokenInfo {
-                id: token.token_id,
-                text: token.token_text.clone(),
-                special: false,
-            },
-            generated_text: Some(generated_text.clone()),
-            details: if token.is_finished {
-                let now = chrono::Utc::now();
-                let queue_ms = (now - queue_time).num_milliseconds() as u64;
-                Some(StreamDetails {
-                    finish_reason: token.finish_reason.unwrap_or_else(|| "length".into()),
-                    generated_tokens: token_count,
-                    queue_time_ms: Some(queue_ms),
-                    inference_time_ms: Some(0),
-                })
-            } else {
-                None
-            },
-        };
+                    token_count += 1;
+                    generated_text.push_str(&token.token_text);
 
-        let json = serde_json::to_string(&response).unwrap_or_default();
-        Ok(Event::default().data(json))
-    })
+                    let response = GenerateStreamResponse {
+                        token: TokenInfo {
+                            id: token.token_id,
+                            text: token.token_text.clone(),
+                            special: false,
+                        },
+                        generated_text: Some(generated_text.clone()),
+                        details: if token.is_finished {
+                            let now = chrono::Utc::now();
+                            let queue_ms = (now - queue_time).num_milliseconds() as u64;
+                            Some(StreamDetails {
+                                finish_reason: token.finish_reason.unwrap_or_else(|| "length".into()),
+                                generated_tokens: token_count,
+                                queue_time_ms: Some(queue_ms),
+                                inference_time_ms: Some(0),
+                            })
+                        } else {
+                            None
+                        },
+                    };
+
+                    let json = serde_json::to_string(&response).unwrap_or_default();
+                    yield Ok(Event::default().data(json));
+
+                    if token.is_finished {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("SSE stream lagged by {} messages for {}", n, request_id);
+                    // 重新订阅
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+    }
 }

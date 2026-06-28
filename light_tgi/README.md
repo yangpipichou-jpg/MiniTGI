@@ -1,9 +1,9 @@
 # Light TGI — 轻量级 LLM 推理调度器
 
 > 教学项目 | 参考 [HuggingFace TGI](https://github.com/huggingface/text-generation-inference) 架构设计  
-> 模型: **Qwen2.5-1.5B-Instruct** (HuggingFace 真实模型) | Python: `F:\ProgramData\anaconda3\python.exe`
+> **v3.0 事件驱动架构** | 模型: **Qwen2.5-1.5B-Instruct** | Python: `F:\ProgramData\anaconda3\python.exe`
 
-Light TGI 是 Text Generation Inference (TGI) 的教学版本，采用 **Rust Router + Python Model Server + gRPC** 架构，实现了 Continuous Batching 调度器，并加载真实的 HuggingFace 模型进行推理。
+Light TGI 是 Text Generation Inference (TGI) 的教学版本，采用 **Rust Router + Python Model Server + gRPC** 架构。v3 升级为**事件驱动架构** (EventBus + Actor 模型)，实现了非阻塞的 Continuous Batching 调度器。
 
 ---
 
