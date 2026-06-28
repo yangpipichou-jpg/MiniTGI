@@ -619,6 +619,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "futures",
+ "futures-util",
  "hyper",
  "parking_lot",
  "prost",

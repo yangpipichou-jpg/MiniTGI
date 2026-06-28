@@ -1,10 +1,10 @@
 """
-gRPC 模型服务器 (事件驱动版本 v3)
+gRPC 模型服务器 (生产级 v4 — Continuous Batching)
 
-架构升级变更:
-  旧: Prefill + Decode 两个独立 RPC, Rust 端控制循环
-  新: ★ StreamGenerate RPC — Session 发一次请求, Python 流式返回所有 token
-       Python 端内部控制 Prefill→Decode 循环, Rust 端只需消费 stream
+架构升级:
+  v3: StreamGenerate RPC — 单请求流式, Session 独立调用
+  v4: ★ BatchStreamGenerate RPC — 双向流, Python 端做真正的 batch forward
+       ★ PrefixCacheLookup / PrefixCacheStore — Prefix Sharing
 
 Python 环境: F:\ProgramData\anaconda3\python.exe
 """
@@ -14,6 +14,8 @@ import logging
 import argparse
 import sys
 import os
+import threading
+import queue
 from concurrent import futures
 
 import grpc
@@ -29,6 +31,7 @@ except ImportError:
     sys.exit(1)
 
 from model_engine import ModelEngine
+from batch_scheduler import BatchScheduler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,11 +41,55 @@ logger = logging.getLogger("grpc_server")
 
 
 class TextGenerationServicer(rpc.TextGenerationServiceServicer):
-    """gRPC 服务实现 (v3: 新增 StreamGenerate)"""
+    """gRPC 服务实现 (v4: Continuous Batching + Prefix Sharing)"""
 
     def __init__(self, engine: ModelEngine):
         self.engine = engine
         self.start_time = time.time()
+
+        # ★ BatchScheduler: 生产级 Continuous Batching
+        self.scheduler = BatchScheduler(
+            engine=engine,
+            max_batch_size=engine.max_batch_size,
+            max_batch_prefill_tokens=int(os.environ.get("MAX_BATCH_PREFILL_TOKENS", "4096")),
+            max_active_requests=int(os.environ.get("MAX_ACTIVE_REQUESTS", "32")),
+            prefix_cache_size=int(os.environ.get("PREFIX_CACHE_SIZE", "64")),
+        )
+
+    def _cleanup_stale_state(self):
+        """
+        清理上一次 BatchStreamGenerate 连接残留的状态。
+
+        当 Rust Router 重连时，旧的 active/pending 请求和 engine cache
+        可能残留，导致跨连接污染（输出混乱）。
+        """
+        # 清理 scheduler 中的活跃和等待请求
+        with self.scheduler.active_lock:
+            for rid, req in list(self.scheduler.active.items()):
+                try:
+                    self.engine.clear_cache([req.cache_handle])
+                except Exception:
+                    pass
+            self.scheduler.active.clear()
+
+        with self.scheduler.pending_lock:
+            self.scheduler.pending.clear()
+
+        # 清理 engine 中残留的 cache (防御性清理)
+        stale_handles = list(self.engine._cache.keys())
+        if stale_handles:
+            logger.warning(
+                f"[BatchStreamGenerate] 清理 {len(stale_handles)} 个残留 cache: "
+                f"{stale_handles}"
+            )
+            self.engine.clear_cache(stale_handles)
+
+        logger.info(
+            f"[BatchStreamGenerate] 状态清理完成: "
+            f"active={self.scheduler.active_count}, "
+            f"pending={self.scheduler.pending_count}, "
+            f"cached={len(self.engine._cache)}"
+        )
 
     # ================================================================
     # Health
@@ -67,22 +114,200 @@ class TextGenerationServicer(rpc.TextGenerationServiceServicer):
         return pb.TokenizeResponse(token_ids=token_ids, token_count=count)
 
     # ================================================================
-    # ★ StreamGenerate — 异步流式生成 (事件驱动架构核心)
+    # ★ BatchStreamGenerate — 双向流 Continuous Batching (v4 核心)
+    # ================================================================
+
+    def BatchStreamGenerate(self, request_iterator, context):
+        """
+        双向流 Continuous Batching
+
+        Rust Router 持续发送 BatchCommand (ADD_REQUEST / CANCEL_REQUEST),
+        Python 端批量调度:
+          - 新请求 → 加入 pending 队列
+          - 定时 step() → batch prefill + batch decode
+          - 流式返回所有请求的 token
+
+        这是真正的 Continuous Batching:
+          - 多个请求共享同一次 GPU forward
+          - 新请求可随时加入
+          - GPU 利用率始终最高
+        """
+        logger.info("[BatchStreamGenerate] 双向流连接建立")
+
+        # ★ 清理上一次连接残留的状态 (防止跨连接污染)
+        self._cleanup_stale_state()
+
+        stop_event = threading.Event()
+        response_queue = queue.Queue()
+        request_ingest_queue = queue.Queue()
+
+        # 启动调度循环线程
+        def scheduler_loop():
+            """独立线程运行调度器"""
+            try:
+                while not stop_event.is_set():
+                    # 1. 从 Rust 侧接收新请求
+                    try:
+                        while True:
+                            cmd = request_ingest_queue.get_nowait()
+                            for req in cmd.get("new_requests", []):
+                                params = req.get("params", {})
+                                self.scheduler.add_request(
+                                    request_id=req["request_id"],
+                                    input_text=req["input_text"],
+                                    max_new_tokens=params.get("max_new_tokens", 100),
+                                    temperature=params.get("temperature", 1.0),
+                                    top_p=params.get("top_p", 1.0),
+                                    top_k=params.get("top_k", 0),
+                                    do_sample=params.get("do_sample", False),
+                                )
+                            for rid in cmd.get("cancel_ids", []):
+                                self.scheduler.cancel_request(rid)
+                    except queue.Empty:
+                        pass
+
+                    # 2. 执行一步调度
+                    if self.scheduler.pending_count > 0 or self.scheduler.active_count > 0:
+                        results = self.scheduler.step()
+                        if results:
+                            response_queue.put(results)
+                    else:
+                        time.sleep(0.005)  # 5ms idle
+            except Exception as e:
+                logger.error(f"[BatchStreamGenerate] 调度线程异常: {e}")
+                response_queue.put(None)  # 信号: 异常退出
+
+        scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
+        scheduler_thread.start()
+
+        # 启动 Rust → Python 接收线程
+        def ingest_loop():
+            """从 Rust 侧接收 BatchCommand"""
+            try:
+                for cmd in request_iterator:
+                    new_requests = []
+                    cancel_ids = []
+
+                    if cmd.command_type == pb.BatchCommandType.ADD_REQUEST:
+                        for req in cmd.new_requests:
+                            params = req.params
+                            new_requests.append({
+                                "request_id": req.request_id,
+                                "input_text": req.input_text,
+                                "params": {
+                                    "max_new_tokens": params.max_new_tokens if params else 100,
+                                    "temperature": params.temperature if params else 1.0,
+                                    "top_p": params.top_p if params else 1.0,
+                                    "top_k": params.top_k if params else 0,
+                                    "do_sample": params.do_sample if params else False,
+                                },
+                            })
+                    elif cmd.command_type == pb.BatchCommandType.CANCEL_REQUEST:
+                        cancel_ids = list(cmd.cancel_request_ids)
+
+                    if new_requests or cancel_ids:
+                        request_ingest_queue.put({
+                            "new_requests": new_requests,
+                            "cancel_ids": cancel_ids,
+                        })
+
+                # Rust 侧 stream 结束
+                logger.info("[BatchStreamGenerate] Rust 侧 stream 关闭")
+            except Exception as e:
+                logger.error(f"[BatchStreamGenerate] 接收线程异常: {e}")
+            finally:
+                stop_event.set()
+
+        ingest_thread = threading.Thread(target=ingest_loop, daemon=True)
+        ingest_thread.start()
+
+        # 主线程: 从 response_queue 取出结果, yield 给 Rust
+        try:
+            while not stop_event.is_set() or not response_queue.empty():
+                try:
+                    results = response_queue.get(timeout=0.05)
+                    if results is None:
+                        break  # 调度线程异常
+
+                    # 构建 BatchStreamResponse
+                    responses = []
+                    for request_id, token_dict, finish_reason in results:
+                        grpc_reason = pb.FinishReason.NONE
+                        if finish_reason == "eos_token":
+                            grpc_reason = pb.FinishReason.EOS_TOKEN
+                        elif finish_reason == "length":
+                            grpc_reason = pb.FinishReason.MAX_TOKENS
+                        elif finish_reason == "error":
+                            grpc_reason = pb.FinishReason.ERROR_REASON
+
+                        resp = pb.StreamGenerateResponse(
+                            request_id=request_id,
+                            finish_reason=grpc_reason,
+                            step=0,
+                            duration_ms=0,
+                            cache_handle=0,
+                        )
+                        if token_dict:
+                            resp.generated_token.CopyFrom(pb.Token(
+                                id=token_dict["id"],
+                                text=token_dict["text"],
+                                logprob=token_dict.get("logprob", 0.0),
+                                special=token_dict.get("special", False),
+                            ))
+                        responses.append(resp)
+
+                    yield pb.BatchStreamResponse(
+                        batch_id=0,
+                        tokens=responses,
+                        active_requests=self.scheduler.active_count,
+                        batch_decode_ms=0,
+                    )
+
+                except queue.Empty:
+                    continue
+
+        except Exception as e:
+            logger.error(f"[BatchStreamGenerate] 主循环异常: {e}")
+        finally:
+            stop_event.set()
+            scheduler_thread.join(timeout=5)
+            ingest_thread.join(timeout=5)
+            logger.info(
+                f"[BatchStreamGenerate] 连接关闭, "
+                f"stats={self.scheduler.get_stats()}"
+            )
+
+    # ================================================================
+    # ★ Prefix Sharing RPCs (v4 新增)
+    # ================================================================
+
+    def PrefixCacheLookup(self, request: pb.PrefixCacheLookupRequest, context) -> pb.PrefixCacheLookupResponse:
+        """查找前缀缓存"""
+        entry = self.scheduler.prefix_cache.lookup(
+            request.prefix_text, request.min_match_tokens
+        )
+        if entry:
+            return pb.PrefixCacheLookupResponse(
+                found=True,
+                shared_cache_handle=entry["cache_handle"],
+                matched_tokens=entry["token_count"],
+            )
+        return pb.PrefixCacheLookupResponse(found=False)
+
+    def PrefixCacheStore(self, request: pb.PrefixCacheStoreRequest, context) -> pb.PrefixCacheStoreResponse:
+        """存储前缀缓存"""
+        self.scheduler.prefix_cache.store(
+            request.prefix_text, request.cache_handle,
+            request.token_count, [],
+        )
+        return pb.PrefixCacheStoreResponse(success=True)
+
+    # ================================================================
+    # ★ StreamGenerate — 单请求流式 (保留兼容)
     # ================================================================
 
     def StreamGenerate(self, request: pb.StreamGenerateRequest, context):
-        """
-        流式生成: 接收一次请求, 持续 yield token 直到完成
-
-        Session 无需再手动控制 Prefill→Decode 循环,
-        Python 端内部完成整个生成流程并通过 stream 返回。
-
-        流程:
-          1. Prefill → yield 首 token + cache_handle
-          2. Decode 循环 → yield 每个 token
-          3. 遇到 EOS 或 max_new_tokens → yield 最后一个 token (finish_reason 非空)
-          4. 清理 KV Cache
-        """
+        """单请求流式生成 (保留兼容, 用于调试)"""
         request_id = request.request_id
         input_text = request.input_text
         params = request.params
@@ -90,7 +315,6 @@ class TextGenerationServicer(rpc.TextGenerationServiceServicer):
         logger.info(f"[StreamGenerate] 开始: request={request_id}")
 
         try:
-            # Step 1: Prefill
             step = 0
             start = time.time()
             cache_handle, tokens, _ = self.engine.prefill(
@@ -104,36 +328,27 @@ class TextGenerationServicer(rpc.TextGenerationServiceServicer):
             )
             duration_ms = int((time.time() - start) * 1000)
 
-            # Yield 首 token
             for token in tokens:
                 is_eos = token["id"] == self.engine.eos_token_id
                 yield pb.StreamGenerateResponse(
                     request_id=request_id,
                     generated_token=pb.Token(
-                        id=token["id"],
-                        text=token["text"],
+                        id=token["id"], text=token["text"],
                         logprob=token.get("logprob", 0.0),
                         special=token.get("special", False),
                     ),
                     finish_reason=pb.FinishReason.EOS_TOKEN if is_eos else pb.FinishReason.NONE,
-                    step=step,
-                    duration_ms=duration_ms,
-                    cache_handle=cache_handle,
+                    step=step, duration_ms=duration_ms, cache_handle=cache_handle,
                 )
-
                 if is_eos:
-                    logger.info(f"[StreamGenerate] EOS 在首 token: request={request_id}")
                     self.engine.clear_cache([cache_handle])
                     return
 
             step += 1
-
-            # Step 2: Decode 循环
             while True:
                 start = time.time()
                 token_dict, finish_reason, _ = self.engine.decode(
-                    request_id=request_id,
-                    cache_handle=cache_handle,
+                    request_id=request_id, cache_handle=cache_handle,
                     max_new_tokens=params.max_new_tokens if params else 100,
                     temperature=params.temperature if params else 1.0,
                     top_p=params.top_p if params else 1.0,
@@ -156,25 +371,17 @@ class TextGenerationServicer(rpc.TextGenerationServiceServicer):
                 yield pb.StreamGenerateResponse(
                     request_id=request_id,
                     generated_token=pb.Token(
-                        id=token_dict["id"],
-                        text=token_dict["text"],
+                        id=token_dict["id"], text=token_dict["text"],
                         logprob=token_dict.get("logprob", 0.0),
                         special=token_dict.get("special", False),
                     ),
-                    finish_reason=grpc_reason,
-                    step=step,
-                    duration_ms=duration_ms,
-                    cache_handle=cache_handle,
+                    finish_reason=grpc_reason, step=step,
+                    duration_ms=duration_ms, cache_handle=cache_handle,
                 )
 
                 if finish_reason:
-                    logger.info(
-                        f"[StreamGenerate] 完成: request={request_id}, "
-                        f"reason={finish_reason}, steps={step}"
-                    )
                     self.engine.clear_cache([cache_handle])
                     return
-
                 step += 1
 
         except Exception as e:
@@ -182,9 +389,7 @@ class TextGenerationServicer(rpc.TextGenerationServiceServicer):
             yield pb.StreamGenerateResponse(
                 request_id=request_id,
                 finish_reason=pb.FinishReason.ERROR_REASON,
-                step=-1,
-                duration_ms=0,
-                cache_handle=0,
+                step=-1, duration_ms=0, cache_handle=0,
             )
 
     # ================================================================

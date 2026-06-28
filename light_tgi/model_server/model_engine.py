@@ -28,6 +28,8 @@ from collections import OrderedDict
 
 import logging
 
+from transformers import DynamicCache
+
 logger = logging.getLogger(__name__)
 
 # 导入 PagedAttention 模块
@@ -367,6 +369,9 @@ class ModelEngine:
         if next_token_id == self.eos_token_id:
             finish_reason = "eos_token"
             paged_cache.is_finished = True
+        elif len(paged_cache.generated_ids) >= max_new_tokens:
+            finish_reason = "length"
+            paged_cache.is_finished = True
 
         # 解码
         token_text = self.tokenizer.decode([next_token_id], skip_special_tokens=False)
@@ -392,20 +397,238 @@ class ModelEngine:
         return token_dict, finish_reason, duration_ms
 
     # ================================================================
+    # Batch Decode — 真正的 Continuous Batching
+    # ================================================================
+
+    def batch_decode(
+        self,
+        request_ids: List[str],
+        cache_handles: List[int],
+        token_ids: List[int],
+        params_list: List[Dict],
+    ) -> Tuple[List[Optional[Dict]], List[Optional[str]], int]:
+        """
+        批量 Decode: 多个请求的 next_token 组成 batch，一次 model.forward()
+
+        这是 Continuous Batching 的核心:
+          - 每个请求只需要 1 个 token 的 forward
+          - 但不同请求处于不同的生成阶段
+          - 所有请求共享同一次 GPU forward → 吞吐量提升 N 倍
+
+        Args:
+            request_ids: 请求 ID 列表
+            cache_handles: KV cache handle 列表
+            token_ids: 每个请求的 last_token_id
+            params_list: 每个请求的采样参数
+
+        Returns:
+            (token_dicts, finish_reasons, duration_ms)
+        """
+        start_time = time.time()
+        batch_size = len(request_ids)
+
+        if batch_size == 0:
+            return [], [], 0
+
+        # 构建 batch 输入: (batch_size, 1)
+        input_tensor = torch.tensor(
+            [[tid] for tid in token_ids], device=self.device, dtype=torch.long
+        )
+
+        # 为每个请求准备 past_key_values
+        batch_past_kv = []
+        for handle in cache_handles:
+            paged_cache = self._cache.get(handle)
+            if paged_cache is None:
+                logger.error(f"[BatchDecode] Cache not found: handle={handle}")
+                return [None] * batch_size, ["error"] * batch_size, 0
+            batch_past_kv.append(paged_cache._past_key_values)
+
+        # ★ 将多个请求的 past_key_values 合并成 batch
+        # past_key_values 是 tuple of (k, v), 每层一个
+        # k: (batch_i, num_kv_heads, seq_len_i, head_dim)
+        # 需要 left-padding 使 seq_len 对齐
+        num_layers = len(batch_past_kv[0])
+        merged_past_kv = []
+
+        # 找到最大 seq_len
+        # past_key_values shape: (1, num_kv_heads, seq_len, head_dim)
+        # shape[2] 是 seq_len 维度
+        max_kv_len = max(
+            pv[0][0].shape[2]  # first layer, key, seq_len dim
+            for pv in batch_past_kv
+        )
+
+        for layer_idx in range(num_layers):
+            padded_keys = []
+            padded_values = []
+
+            for pv in batch_past_kv:
+                k, v = pv[layer_idx]  # each: (1, num_kv_heads, seq_len, head_dim)
+                seq_len = k.shape[2]  # shape[2] = seq_len
+
+                if seq_len < max_kv_len:
+                    pad_len = max_kv_len - seq_len
+                    # Left-pad with zeros
+                    k_padded = torch.nn.functional.pad(k, (0, 0, pad_len, 0), value=0.0)
+                    v_padded = torch.nn.functional.pad(v, (0, 0, pad_len, 0), value=0.0)
+                else:
+                    k_padded = k
+                    v_padded = v
+
+                padded_keys.append(k_padded)
+                padded_values.append(v_padded)
+
+            merged_k = torch.cat(padded_keys, dim=0)  # (batch, num_kv_heads, max_len, head_dim)
+            merged_v = torch.cat(padded_values, dim=0)
+            merged_past_kv.append((merged_k, merged_v))
+
+        merged_past_kv = tuple(merged_past_kv)
+
+        # ★ 构建 attention_mask: 屏蔽 left-padding 位置
+        # 每个请求的 past KV 长度为 seq_len_i, 被 left-pad 到 max_kv_len
+        # 总序列长度 = max_kv_len (past) + 1 (new token)
+        # attention_mask: 1 表示有效位置, 0 表示 padding
+        kv_lengths = [pv[0][0].shape[2] for pv in batch_past_kv]
+        total_len = max_kv_len + 1
+        batch_attention_mask = torch.zeros(batch_size, total_len, device=self.device, dtype=torch.long)
+        for i, kv_len in enumerate(kv_lengths):
+            pad_len = max_kv_len - kv_len
+            batch_attention_mask[i, pad_len:] = 1  # valid positions: [pad..., past_kv..., new_token]
+
+        # ★ 转换为 DynamicCache (新版 transformers 期望的格式)
+        batch_dynamic_cache = DynamicCache.from_legacy_cache(merged_past_kv)
+
+        # ★ Batch forward: 所有请求一起做 attention
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_tensor,
+                past_key_values=batch_dynamic_cache,
+                attention_mask=batch_attention_mask,
+                use_cache=True,
+            )
+
+        # 获取每个请求的 logits
+        logits = outputs.logits[:, -1, :]  # (batch, vocab_size)
+
+        # 为每个请求更新 past_key_values (从 batch 中切回单请求)
+        new_batch_past_kv = outputs.past_key_values
+
+        # ★ 关键: 将 DynamicCache 转为可索引的 list of (k, v) tuples
+        #    避免直接在 DynamicCache 上迭代时出现版本兼容问题
+        if isinstance(new_batch_past_kv, DynamicCache):
+            new_batch_kv_tuples = [
+                (new_batch_past_kv.key_cache[l], new_batch_past_kv.value_cache[l])
+                for l in range(len(new_batch_past_kv.key_cache))
+            ]
+        else:
+            new_batch_kv_tuples = list(new_batch_past_kv)
+
+        token_dicts = []
+        finish_reasons = []
+
+        for i in range(batch_size):
+            request_id = request_ids[i]
+            handle = cache_handles[i]
+            params = params_list[i]
+            paged_cache = self._cache.get(handle)
+
+            if paged_cache is None:
+                token_dicts.append(None)
+                finish_reasons.append("error")
+                continue
+
+            # ★ 从 batch past_key_values 中切出该请求的部分
+            #    每个请求在 batch 中的实际 KV 长度 = 原 seq_len + 1 (新 token)
+            #    使用 seq_len 而非 seq_len+1 是因为 advance 还没执行
+            actual_kv_len = paged_cache.seq_len + 1
+            own_past_kv = tuple(
+                (k[i:i+1, :, -actual_kv_len:, :],
+                 v[i:i+1, :, -actual_kv_len:, :])
+                for k, v in new_batch_kv_tuples
+            )
+            # ★ 转为 DynamicCache 以兼容新版 transformers
+            paged_cache._past_key_values = DynamicCache.from_legacy_cache(own_past_kv)
+
+            # 同步写入 BlockPool
+            self._append_kv_to_pool(paged_cache, own_past_kv)
+
+            # 推进序列 (必须在切片后执行，因为切片依赖旧 seq_len)
+            paged_cache.advance([token_ids[i]])
+
+            # 采样
+            next_token_id = self._sample_token(
+                logits[i:i+1],
+                params.get("temperature", 1.0),
+                params.get("top_p", 1.0),
+                params.get("top_k", 0),
+                params.get("do_sample", False),
+            )
+            paged_cache.generated_ids.append(next_token_id)
+
+            # 判断停止
+            max_tokens = params.get("max_new_tokens", 100)
+            finish_reason = None
+            if next_token_id == self.eos_token_id:
+                finish_reason = "eos_token"
+                paged_cache.is_finished = True
+            elif len(paged_cache.generated_ids) >= max_tokens:
+                finish_reason = "length"
+                paged_cache.is_finished = True
+
+            token_text = self.tokenizer.decode([next_token_id], skip_special_tokens=False)
+
+            token_dicts.append({
+                "id": next_token_id,
+                "text": token_text,
+                "logprob": -0.3,
+                "special": next_token_id == self.eos_token_id,
+            })
+            finish_reasons.append(finish_reason)
+
+            logger.info(
+                f"[BatchDecode] req={request_id}, token={next_token_id}({repr(token_text)}), "
+                f"finish={finish_reason}, seq_len={paged_cache.seq_len}, "
+                f"actual_kv_len={actual_kv_len}, eos={self.eos_token_id}"
+            )
+
+        duration_ms = int((time.time() - start_time) * 1000)
+        self.stats["total_decodes"] += batch_size
+        self.stats["total_tokens_generated"] += batch_size
+
+        logger.info(
+            f"[BatchDecode] batch_size={batch_size}, "
+            f"duration={duration_ms}ms, "
+            f"avg={duration_ms/batch_size:.1f}ms/req, "
+            f"finish_reasons={finish_reasons}"
+        )
+
+        return token_dicts, finish_reasons, duration_ms
+
+    # ================================================================
     # PagedAttention 辅助方法 — K/V 提取与写入
     # ================================================================
 
     def _write_kv_to_pool(
         self,
         paged_cache: PagedKVCache,
-        past_key_values: Tuple,
+        past_key_values,
         seq_len: int,
     ):
         """写入完整序列的 K/V 到已分配的 blocks (用于 prefill)"""
         block_size = self.paged_config.block_size
         num_blocks_needed = (seq_len + block_size - 1) // block_size
 
-        for layer_idx, (k, v) in enumerate(past_key_values):
+        # ★ 兼容 DynamicCache 和 tuple
+        if isinstance(past_key_values, DynamicCache):
+            kv_iter = [
+                (past_key_values.key_cache[l], past_key_values.value_cache[l])
+                for l in range(len(past_key_values.key_cache))
+            ]
+        else:
+            kv_iter = past_key_values
+
+        for layer_idx, (k, v) in enumerate(kv_iter):
             k_layer = k[0]  # (num_kv_heads, seq_len, head_dim)
             v_layer = v[0]
 
@@ -424,13 +647,16 @@ class ModelEngine:
     def _append_kv_to_pool(
         self,
         paged_cache: PagedKVCache,
-        past_key_values: Tuple,
+        past_key_values,
     ):
         """
         追加新 token 的 K/V 到 BlockPool
 
         对于 decode 阶段，past_key_values 包含完整序列，
         但我们只需要最后一个位置的 K/V
+
+        Args:
+            past_key_values: 可以是 tuple of (k, v) 或 DynamicCache
         """
         if paged_cache.need_new_block():
             paged_cache.allocate_block()
@@ -438,7 +664,16 @@ class ModelEngine:
         offset = paged_cache.seq_len % self.paged_config.block_size
         physical_id = paged_cache.block_table[-1]
 
-        for layer_idx, (k, v) in enumerate(past_key_values):
+        # ★ 兼容 DynamicCache 和 tuple
+        if isinstance(past_key_values, DynamicCache):
+            kv_iter = [
+                (past_key_values.key_cache[l], past_key_values.value_cache[l])
+                for l in range(len(past_key_values.key_cache))
+            ]
+        else:
+            kv_iter = past_key_values
+
+        for layer_idx, (k, v) in enumerate(kv_iter):
             # 取最后一个 token 的 K/V
             k_new = k[0, :, -1:, :]  # (num_kv_heads, 1, head_dim)
             v_new = v[0, :, -1:, :]
@@ -567,6 +802,15 @@ class ModelEngine:
         logits = outputs.logits[:, -1, :]
         past_key_values = outputs.past_key_values
 
+        # ★ 标准化: 将 DynamicCache 转为 list of (k, v) tuples
+        if isinstance(past_key_values, DynamicCache):
+            past_kv_tuples = [
+                (past_key_values.key_cache[l], past_key_values.value_cache[l])
+                for l in range(len(past_key_values.key_cache))
+            ]
+        else:
+            past_kv_tuples = list(past_key_values)
+
         # 为每个请求创建 PagedKVCache 并写入 K/V
         results = []
         for i, info in enumerate(request_info):
@@ -591,7 +835,7 @@ class ModelEngine:
 
             # ★ 从 batch past_key_values 提取该请求的 K/V
             # 跳过 padding 部分 (左侧 pad)
-            for layer_idx, (k, v) in enumerate(past_key_values):
+            for layer_idx, (k, v) in enumerate(past_kv_tuples):
                 k_layer = k[i, :, pad_len:, :]  # (num_kv_heads, input_len, head_dim)
                 v_layer = v[i, :, pad_len:, :]
 
@@ -609,11 +853,12 @@ class ModelEngine:
 
             # ★ 保存该请求的 past_key_values 切片用于后续 decode
             # 每个请求只需要自己的那部分 (去掉 padding)
+            # 转换为 DynamicCache 以兼容新版 transformers
             own_past_kv = tuple(
                 (k[i:i+1, :, pad_len:, :], v[i:i+1, :, pad_len:, :])
-                for k, v in past_key_values
+                for k, v in past_kv_tuples
             )
-            paged_cache._past_key_values = own_past_kv
+            paged_cache._past_key_values = DynamicCache.from_legacy_cache(own_past_kv)
 
             paged_cache.advance(input_ids)
 

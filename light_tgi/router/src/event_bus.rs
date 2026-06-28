@@ -103,7 +103,7 @@ pub struct BatchReadyEvent {
 // ============================================================
 
 /// 事件总线的 channel 容量
-const EVENT_CHANNEL_CAPACITY: usize = 1024;
+const EVENT_CHANNEL_CAPACITY: usize = 4096;
 
 pub struct EventBus {
     /// 新请求事件: HTTP Server → Scheduler
@@ -149,12 +149,14 @@ impl EventBus {
     // Session 事件 (Session → Scheduler)
     // ============================================================
 
-    /// 发布 Session 事件
+    /// 发布 Session 事件 (v3 fallback)
+    #[allow(dead_code)]
     pub fn publish_session_event(&self, event: SessionEvent) {
         let _ = self.session_tx.send(event);
     }
 
-    /// 订阅 Session 事件 (Scheduler 使用)
+    /// 订阅 Session 事件 (Scheduler 使用, v3 fallback)
+    #[allow(dead_code)]
     pub fn subscribe_session_event(&self) -> broadcast::Receiver<SessionEvent> {
         self.session_tx.subscribe()
     }
@@ -174,10 +176,10 @@ impl EventBus {
     }
 
     // ============================================================
-    // Schedule 指令 (Scheduler → Session, point-to-point)
+    // Schedule 指令 (Scheduler → Session, point-to-point, v3 fallback)
     // ============================================================
 
-    /// 为 request_id 注册调度命令通道
+    #[allow(dead_code)]
     pub fn register_schedule_channel(
         &self,
         request_id: String,
@@ -186,14 +188,14 @@ impl EventBus {
         self.schedule_commands.insert(request_id, tx);
     }
 
-    /// 向指定 request_id 发送调度指令
+    #[allow(dead_code)]
     pub fn send_schedule_command(&self, request_id: &str, cmd: ScheduleCommand) {
         if let Some(tx) = self.schedule_commands.get(request_id) {
             let _ = tx.send(cmd);
         }
     }
 
-    /// 移除调度命令通道
+    #[allow(dead_code)]
     pub fn unregister_schedule_channel(&self, request_id: &str) {
         self.schedule_commands.remove(request_id);
     }

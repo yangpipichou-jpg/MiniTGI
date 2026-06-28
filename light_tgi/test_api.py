@@ -23,7 +23,7 @@ def test_generate(host="localhost", port=3000):
     payload = {
         "inputs": "What is the capital of France? Answer briefly.",
         "parameters": {
-            "max_new_tokens": 50,
+            "max_new_tokens": 80,
             "temperature": 0.7,
             "do_sample": True,
         },
@@ -95,7 +95,7 @@ def test_concurrent():
     def send_request(i, prompt):
         payload = {
             "inputs": prompt,
-            "parameters": {"max_new_tokens": 30, "temperature": 0.7},
+            "parameters": {"max_new_tokens": 80, "temperature": 0.7, "do_sample": True},
         }
         try:
             start = time.time()

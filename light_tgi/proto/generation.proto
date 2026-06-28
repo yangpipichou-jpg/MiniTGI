@@ -3,12 +3,12 @@ syntax = "proto3";
 package light_tgi;
 
 // ============================================================
-// Light TGI - gRPC 协议定义 (v3: 事件驱动架构)
+// Light TGI - gRPC 协议定义 (v4: 生产级 Continuous Batching)
 //
 // 架构变更:
-//   - 新增 StreamGenerate RPC: 异步流式推理 (双向流)
-//   - 保留批量接口兼容旧逻辑
-//   - Router 不做 tokenization，传原始文本
+//   - 新增 BatchStreamGenerate: 双向流 — Rust 持续推送请求, Python 批量 forward
+//   - 新增 PrefixCacheLookup / PrefixCacheStore: Prefix Sharing
+//   - 保留 StreamGenerate 用于单请求场景
 // ============================================================
 
 // ---------- 基本类型 ----------
@@ -27,6 +27,12 @@ enum FinishReason {
   MAX_TOKENS = 2;
   STOP_SEQUENCE = 3;
   ERROR_REASON = 4;
+}
+
+enum BatchCommandType {
+  ADD_REQUEST = 0;      // 新增请求 (prefill)
+  CANCEL_REQUEST = 1;   // 取消请求
+  BATCH_DECODE = 2;     // 批量 decode 步 (由 Python 端定时触发)
 }
 
 message Token {
@@ -50,7 +56,49 @@ message GenerationParameters {
   bool do_sample = 9;
 }
 
-// Prefill: 发送原始文本
+// ---------- ★ BatchStreamGenerate: 双向流 Continuous Batching (v4 核心) ----------
+
+/// Rust → Python: 批量调度命令
+message BatchCommand {
+  BatchCommandType command_type = 1;
+  repeated StreamGenerateRequest new_requests = 2;  // ADD_REQUEST 时携带
+  repeated string cancel_request_ids = 3;            // CANCEL_REQUEST 时携带
+  int64 batch_id = 4;
+}
+
+/// Python → Rust: 批量 token 输出
+message BatchStreamResponse {
+  int64 batch_id = 1;
+  repeated StreamGenerateResponse tokens = 2;
+  int32 active_requests = 3;         // 当前 batch 中的活跃请求数
+  int32 batch_decode_ms = 4;         // 本步 batch decode 耗时
+}
+
+// ---------- ★ Prefix Sharing (v4 新增) ----------
+
+message PrefixCacheLookupRequest {
+  string prefix_text = 1;   // 前缀文本
+  int32 min_match_tokens = 2; // 最小匹配 token 数
+}
+
+message PrefixCacheLookupResponse {
+  bool found = 1;
+  int64 shared_cache_handle = 2;  // 可复用的 cache handle
+  int32 matched_tokens = 3;       // 匹配的 token 数
+}
+
+message PrefixCacheStoreRequest {
+  string prefix_text = 1;
+  int64 cache_handle = 2;
+  int32 token_count = 3;
+}
+
+message PrefixCacheStoreResponse {
+  bool success = 1;
+}
+
+// ---------- 原有消息 (保留兼容) ----------
+
 message PrefillRequest {
   string request_id = 1;
   string input_text = 2;
@@ -67,7 +115,6 @@ message PrefillResponse {
   int32 prompt_token_count = 5;
 }
 
-// Decode
 message DecodeRequest {
   string request_id = 1;
   int32 token_id = 2;
@@ -82,26 +129,20 @@ message DecodeResponse {
   int32 decode_duration_ms = 4;
 }
 
-// ---------- ★ 异步流式推理 (事件驱动架构核心) ----------
-
-/// Session 向 Python 发送的请求 (一次完整的生成流程)
 message StreamGenerateRequest {
   string request_id = 1;
   string input_text = 2;
   GenerationParameters params = 3;
 }
 
-/// Python 向 Session 流式返回的 token
 message StreamGenerateResponse {
   string request_id = 1;
   Token generated_token = 2;
   FinishReason finish_reason = 3;
-  int32 step = 4;                    // 当前步数 (prefill=0, decode=1,2,...)
-  int32 duration_ms = 5;             // 本步耗时
-  int64 cache_handle = 6;            // KV cache 句柄 (prefill 步返回)
+  int32 step = 4;
+  int32 duration_ms = 5;
+  int64 cache_handle = 6;
 }
-
-// ---------- 批量接口 (保留) ----------
 
 message BatchPrefillRequest {
   int64 batch_id = 1;
@@ -123,8 +164,6 @@ message BatchDecodeResponse {
   repeated DecodeResponse responses = 2;
 }
 
-// ---------- Tokenize ----------
-
 message TokenizeRequest {
   string text = 1;
 }
@@ -133,8 +172,6 @@ message TokenizeResponse {
   repeated int32 token_ids = 1;
   int32 token_count = 2;
 }
-
-// ---------- 模型信息 ----------
 
 message ModelInfoRequest {}
 
@@ -147,8 +184,6 @@ message ModelInfoResponse {
   string device = 6;
 }
 
-// ---------- 清理缓存 ----------
-
 message ClearCacheRequest {
   repeated int64 cache_handles = 1;
 }
@@ -157,26 +192,26 @@ message ClearCacheResponse {
   bool success = 1;
 }
 
-// ---------- gRPC 服务定义 ----------
+// ---------- gRPC 服务定义 (v4) ----------
 
 service TextGenerationService {
-  // 健康检查 / 模型信息
   rpc Health (ModelInfoRequest) returns (ModelInfoResponse);
-
-  // Tokenize: 文本 → token ids
   rpc Tokenize (TokenizeRequest) returns (TokenizeResponse);
 
-  // ★ 异步流式生成 (事件驱动架构核心)
-  //   Session 发送一次请求, Python 持续流式返回 token
-  //   替代原来的 Prefill → Decode 循环
+  // ★ v4 核心: 双向流 Continuous Batching
+  //   Rust Router 持续推送新请求 + 取消指令
+  //   Python Model Server 批量 forward, 流式返回所有请求的 token
+  rpc BatchStreamGenerate (stream BatchCommand) returns (stream BatchStreamResponse);
+
+  // ★ Prefix Sharing
+  rpc PrefixCacheLookup (PrefixCacheLookupRequest) returns (PrefixCacheLookupResponse);
+  rpc PrefixCacheStore (PrefixCacheStoreRequest) returns (PrefixCacheStoreResponse);
+
+  // 单请求流式生成 (兼容, 用于调试/fallback)
   rpc StreamGenerate (StreamGenerateRequest) returns (stream StreamGenerateResponse);
 
-  // 批量预填充 (保留, 兼容旧逻辑)
+  // 批量接口 (保留兼容)
   rpc Prefill (BatchPrefillRequest) returns (BatchPrefillResponse);
-
-  // 批量解码 (保留, 兼容旧逻辑)
   rpc Decode (BatchDecodeRequest) returns (BatchDecodeResponse);
-
-  // 清理 KV cache
   rpc ClearCache (ClearCacheRequest) returns (ClearCacheResponse);
 }

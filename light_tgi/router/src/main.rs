@@ -1,13 +1,13 @@
-//! Light TGI Router - 入口文件 (事件驱动架构 v3)
+//! Light TGI Router - 入口文件 (生产级 v4: Continuous Batching)
 //!
-//! 架构升级变更:
-//!   旧: server → queue(mpsc) → scheduler(同步阻塞) → grpc
-//!   新: server → EventBus → Scheduler Actor → Session Actor → grpc (异步流)
+//! 架构升级:
+//!   v3: server → EventBus → Scheduler Actor → Session Actor × N → gRPC
+//!   v4: server → EventBus → Scheduler → BatchStreamGenerate (双向流) → Python BatchScheduler
 //!
 //! 启动流程:
 //!   1. 初始化 EventBus (全局消息中枢)
 //!   2. 连接 gRPC (Python Model Server)
-//!   3. 启动 Scheduler Actor (tokio::spawn)
+//!   3. 启动 Scheduler (tokio::spawn) — 维护 BatchStreamGenerate 双向流
 //!   4. 启动 HTTP Server (Axum)
 
 mod server;
@@ -25,7 +25,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use crate::config::RouterConfig;
 use crate::event_bus::EventBus;
 use crate::infer::GrpcClient;
-use crate::scheduler::SchedulerActor;
+use crate::scheduler::Scheduler;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!("=== Light TGI Router v3 (事件驱动架构) 启动中 ===");
+    tracing::info!("=== Light TGI Router v4 (Continuous Batching) 启动中 ===");
 
     // 加载配置
     let config = RouterConfig::from_env()?;
@@ -64,18 +64,18 @@ async fn main() -> anyhow::Result<()> {
     // 2. ★ 创建 EventBus (全局消息中枢)
     let event_bus = EventBus::new();
 
-    // 3. ★ 创建 Scheduler Actor
-    let scheduler = SchedulerActor::new(
+    // 3. ★ 创建 Scheduler (v4: Continuous Batching)
+    let scheduler = Scheduler::new(
         config.clone(),
         grpc_client.clone(),
         event_bus.clone(),
     );
 
-    // 4. ★ spawn Scheduler Actor (异步、独立运行)
+    // 4. ★ spawn Scheduler (异步、独立运行)
     tokio::spawn(async move {
         scheduler.run().await;
     });
-    tracing::info!("Scheduler Actor 已启动");
+    tracing::info!("Scheduler (Continuous Batching) 已启动");
 
     // 5. 创建并发控制信号量 (过载保护)
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));

@@ -1,9 +1,8 @@
 # Light TGI — 轻量级 LLM 推理调度器
 
-> 教学项目 | 参考 [HuggingFace TGI](https://github.com/huggingface/text-generation-inference) 架构设计  
-> **v3.0 事件驱动架构** | 模型: **Qwen2.5-1.5B-Instruct** | Python: `F:\ProgramData\anaconda3\python.exe`
+> **生产级 v4.0** | Continuous Batching + Prefix Sharing | 模型: **Qwen2.5-1.5B-Instruct** | Python: `F:\ProgramData\anaconda3\python.exe`
 
-Light TGI 是 Text Generation Inference (TGI) 的教学版本，采用 **Rust Router + Python Model Server + gRPC** 架构。v3 升级为**事件驱动架构** (EventBus + Actor 模型)，实现了非阻塞的 Continuous Batching 调度器。
+Light TGI 是 Text Generation Inference (TGI) 的轻量级生产版本，采用 **Rust Router + Python Model Server + gRPC 双向流** 架构。v4 实现了真正的 Continuous Batching 和 Prefix Sharing。
 
 ---
 
@@ -24,8 +23,7 @@ Light TGI 是 Text Generation Inference (TGI) 的教学版本，采用 **Rust Ro
 start_model_server.bat
 ```
 
-> 首次运行会下载 Qwen2.5-1.5B-Instruct 模型 (~3GB)，请耐心等待。  
-> 模型加载完成后会显示: `模型加载完成: 1.54B 参数`
+> 首次运行会下载 Qwen2.5-1.5B-Instruct 模型 (~3GB)，请耐心等待。
 
 **终端 2 — Rust Router**:
 
@@ -54,29 +52,29 @@ curl -X POST http://localhost:3000/generate \
 
 ```
 light_tgi/
-├── proto/generation.proto       # gRPC 协议 (v2: 真实模型版本)
-├── router/                      # Rust HTTP Router + 调度器
+├── proto/generation.proto       # gRPC 协议 (v4: BatchStreamGenerate + PrefixCache)
+├── router/                      # Rust HTTP Router + Scheduler
 │   └── src/
 │       ├── main.rs              # 入口
 │       ├── server.rs            # HTTP Server (Axum) + Tokenize 验证
-│       ├── queue.rs             # 请求队列 (原始文本)
-│       ├── scheduler.rs         # Continuous Batching 调度器 (核心)
-│       ├── infer.rs             # gRPC 客户端 (含 Tokenize RPC)
+│       ├── scheduler.rs         # ★ Continuous Batching Scheduler
+│       ├── session.rs           # Session Actor (保留兼容)
+│       ├── queue.rs             # 数据结构
+│       ├── infer.rs             # gRPC 客户端 (BatchStreamGenerate)
+│       ├── event_bus.rs         # 全局消息中枢
 │       └── config.rs            # 配置管理
 ├── model_server/                # Python gRPC 模型服务
-│   ├── grpc_server.py           # gRPC 服务实现
-│   ├── model_engine.py          # ★ 真实 HuggingFace 模型推理引擎
+│   ├── grpc_server.py           # ★ gRPC 服务 (BatchStreamGenerate + PrefixCache)
+│   ├── batch_scheduler.py       # ★ Continuous Batching 调度器
+│   ├── model_engine.py          # ★ 真实 HuggingFace 模型推理引擎 (PagedAttention)
+│   ├── paged_attention.py       # ★ Paged KV Cache (BlockPool + BlockTable)
 │   ├── generate_proto.py        # Proto 编译脚本
 │   └── test_client.py           # gRPC 测试
 ├── k8s/                         # Kubernetes 部署
-│   ├── Dockerfile.router        # Rust Router 镜像
-│   ├── Dockerfile.model_server  # Python Model Server 镜像
-│   ├── deployment.yaml          # K8S 部署清单 (CPU)
-│   └── gpu-deployment.yaml      # K8S 部署清单 (GPU)
 ├── test_api.py                  # HTTP API 测试
 ├── start_model_server.bat       # 一键启动 Model Server
 ├── start_router.bat             # 一键编译启动 Router
-├── DESIGN_DOC.md                # 详细设计文档
+├── DESIGN_DOC.md                # ★ 详细设计文档
 └── README.md                    # 本文档
 ```
 
@@ -90,35 +88,34 @@ Client (HTTP/SSE)
     ▼
 ┌──────────────────────────────────────┐
 │  Rust Router (HTTP Server)           │
-│  ┌────────┐ ┌────────┐ ┌──────────┐ │
-│  │ Server │→│ Queue  │→│ Scheduler│ │
-│  │ 验证    │ │ 原始文本│ │ 组Batch  │ │
-│  │ 限流    │ │ 通知   │ │ Prefill  │ │
-│  │ Tokenize│ │        │ │ Decode   │ │
-│  └────────┘ └────────┘ └────┬─────┘ │
-└──────────────────────────────┼───────┘
-                               │ gRPC
-                               ▼
+│  ┌────────┐ ┌──────────┐ ┌────────┐ │
+│  │ Server │→│ EventBus │→│Schedlr │ │
+│  │ 验证    │ │          │ │Batch   │ │
+│  │ 限流    │ │ Token    │ │Stream  │ │
+│  └────────┘ └──────────┘ └───┬────┘ │
+└───────────────────────────────┼──────┘
+                                │ gRPC Bidirectional Stream
+                                ▼
 ┌──────────────────────────────────────┐
-│  Python Model Server (gRPC)          │
+│  Python Model Server                 │
 │  ┌────────────┐ ┌──────────────────┐ │
-│  │gRPC Server │→│  ModelEngine     │ │
-│  │            │ │  Qwen2.5-1.5B    │ │
-│  │            │ │  Tokenizer       │ │
-│  │            │ │  model.forward() │ │
-│  │            │ │  past_key_values │ │
+│  │BatchSchedlr│→│  ModelEngine     │ │
+│  │Continuous  │ │  Qwen2.5-1.5B    │ │
+│  │Batching    │ │  PagedAttention  │ │
+│  │PrefixCache │ │  BlockPool       │ │
 │  └────────────┘ └──────────────────┘ │
 └──────────────────────────────────────┘
 ```
 
 ## 核心特性
 
+- **Continuous Batching**: 多个请求共享同一次 GPU forward，吞吐量提升 N 倍
+- **Prefix Sharing**: 相同前缀的请求复用 KV Cache blocks
+- **PagedAttention**: vLLM 风格分页 KV Cache，零显存浪费
+- **BatchStreamGenerate**: 双向流 gRPC，Python 端批量调度
 - **真实模型**: 加载 Qwen2.5-1.5B-Instruct 进行真实推理
-- **Continuous Batching**: 动态批处理，最大化 GPU/CPU 利用率
 - **过载保护**: Semaphore 信号量限制并发，超出返回 429
 - **流式输出**: SSE 实时推送 token
-- **预算驱动调度**: 基于 token 预算的智能组 batch
-- **KV Cache 复用**: past_key_values 在 Prefill 和 Decode 间传递
 - **K8S 就绪**: Dockerfile + Deployment + Service + HPA
 
 ## 支持的模型
@@ -152,5 +149,6 @@ kubectl -n light-tgi get pods,svc,hpa
 ## 参考资料
 
 - [TGI GitHub](https://github.com/huggingface/text-generation-inference)
-- [Qwen2.5](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct)
 - [vLLM: Continuous Batching](https://arxiv.org/abs/2308.09596)
+- [PagedAttention Paper](https://arxiv.org/abs/2309.06180)
+- [Qwen2.5](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct)

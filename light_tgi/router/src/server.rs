@@ -135,13 +135,11 @@ async fn generate_handler(
         }
     };
 
-    // ---- 3. 创建 SSE 流 (通过 EventBus 订阅 token 事件) ----
+    // ---- 3. 创建专用 mpsc channel (替代 broadcast, 避免 Lagged 消息丢失) ----
     let request_id = uuid::Uuid::new_v4().to_string();
+    let (token_tx, token_rx) = mpsc::unbounded_channel::<QueueToken>();
 
-    // ★ 订阅 token 事件 (全局 broadcast, 按 request_id 过滤)
-    let token_rx = state.event_bus.subscribe_token();
-
-    // ★ 发布新请求事件到 EventBus → Scheduler 会收到
+    // ★ 发布新请求事件到 EventBus → Scheduler 会收到 (带上专用 response_tx)
     let event = NewRequestEvent {
         request_id: request_id.clone(),
         input_text,
@@ -150,7 +148,7 @@ async fn generate_handler(
         top_p: params.top_p,
         top_k: params.top_k,
         do_sample: params.do_sample,
-        response_tx: mpsc::unbounded_channel().0, // 不再使用, 通过 EventBus
+        response_tx: token_tx,  // ★ 专用 mpsc sender
         queue_time,
     };
     state.event_bus.publish_new_request(event);
@@ -245,10 +243,10 @@ struct ValidatedParams {
     do_sample: bool,
 }
 
-/// 构建 SSE 流 — 从 EventBus 订阅 token 事件, 按 request_id 过滤
+/// 构建 SSE 流 — 通过专用 mpsc channel 接收 token (不再使用 broadcast, 避免 Lagged 消息丢失)
 fn build_sse_stream(
-    request_id: String,
-    mut token_rx: tokio::sync::broadcast::Receiver<QueueToken>,
+    _request_id: String,
+    mut token_rx: mpsc::UnboundedReceiver<QueueToken>,
     _permit: tokio::sync::OwnedSemaphorePermit,
     queue_time: chrono::DateTime<chrono::Utc>,
 ) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
@@ -256,53 +254,36 @@ fn build_sse_stream(
     let mut token_count: u32 = 0;
 
     async_stream::stream! {
-        loop {
-            match token_rx.recv().await {
-                Ok(token) => {
-                    // ★ 只处理属于当前请求的 token
-                    if token.request_id != request_id {
-                        continue;
-                    }
+        while let Some(token) = token_rx.recv().await {
+            token_count += 1;
+            generated_text.push_str(&token.token_text);
 
-                    token_count += 1;
-                    generated_text.push_str(&token.token_text);
+            let response = GenerateStreamResponse {
+                token: TokenInfo {
+                    id: token.token_id,
+                    text: token.token_text.clone(),
+                    special: false,
+                },
+                generated_text: Some(generated_text.clone()),
+                details: if token.is_finished {
+                    let now = chrono::Utc::now();
+                    let queue_ms = (now - queue_time).num_milliseconds() as u64;
+                    Some(StreamDetails {
+                        finish_reason: token.finish_reason.unwrap_or_else(|| "length".into()),
+                        generated_tokens: token_count,
+                        queue_time_ms: Some(queue_ms),
+                        inference_time_ms: Some(0),
+                    })
+                } else {
+                    None
+                },
+            };
 
-                    let response = GenerateStreamResponse {
-                        token: TokenInfo {
-                            id: token.token_id,
-                            text: token.token_text.clone(),
-                            special: false,
-                        },
-                        generated_text: Some(generated_text.clone()),
-                        details: if token.is_finished {
-                            let now = chrono::Utc::now();
-                            let queue_ms = (now - queue_time).num_milliseconds() as u64;
-                            Some(StreamDetails {
-                                finish_reason: token.finish_reason.unwrap_or_else(|| "length".into()),
-                                generated_tokens: token_count,
-                                queue_time_ms: Some(queue_ms),
-                                inference_time_ms: Some(0),
-                            })
-                        } else {
-                            None
-                        },
-                    };
+            let json = serde_json::to_string(&response).unwrap_or_default();
+            yield Ok(Event::default().data(json));
 
-                    let json = serde_json::to_string(&response).unwrap_or_default();
-                    yield Ok(Event::default().data(json));
-
-                    if token.is_finished {
-                        break;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("SSE stream lagged by {} messages for {}", n, request_id);
-                    // 重新订阅
-                    continue;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    break;
-                }
+            if token.is_finished {
+                break;
             }
         }
     }
