@@ -19,8 +19,6 @@ use axum::{
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Semaphore};
-use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio_stream::StreamExt;
 
 use crate::config::RouterConfig;
 use crate::event_bus::{EventBus, NewRequestEvent, QueueToken};
@@ -141,7 +139,7 @@ async fn generate_handler(
     let request_id = uuid::Uuid::new_v4().to_string();
 
     // ★ 订阅 token 事件 (全局 broadcast, 按 request_id 过滤)
-    let mut token_rx = state.event_bus.subscribe_token();
+    let token_rx = state.event_bus.subscribe_token();
 
     // ★ 发布新请求事件到 EventBus → Scheduler 会收到
     let event = NewRequestEvent {

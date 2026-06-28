@@ -1,0 +1,17 @@
+# --- Rust 编译产物 (这是解决你警告的核心) ---
+/target/
+
+# --- Rust 项目维护 ---
+# 如果你是开发 Rust 库（library），才需要忽略 Cargo.lock
+# 如果你是开发可执行程序（binary，比如 TGI 服务），建议保留 Cargo.lock 以保证环境一致
+# /Cargo.lock
+
+# --- IDE / 编辑器配置 ---
+.idea/
+.vscode/
+*.swp
+*~
+
+# --- 操作系统痕迹 ---
+.DS_Store
+Thumbs.db

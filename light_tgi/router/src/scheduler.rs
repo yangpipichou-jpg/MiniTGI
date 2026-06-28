@@ -14,11 +14,10 @@
 //!   - Scheduler 只做协调，不做执行
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::config::RouterConfig;
-use crate::event_bus::{EventBus, NewRequestEvent, ScheduleCommand, SessionEvent};
+use crate::event_bus::{EventBus, ScheduleCommand, SessionEvent};
 use crate::infer::GrpcClient;
 use crate::session::Session;
 

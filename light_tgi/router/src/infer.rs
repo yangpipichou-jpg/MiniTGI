@@ -5,6 +5,7 @@
 //!   - PrefillRequest 携带 input_text 而非 input_ids
 
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
 pub mod pb {
@@ -15,15 +16,15 @@ use pb::{
     text_generation_service_client::TextGenerationServiceClient,
     BatchPrefillRequest, BatchPrefillResponse,
     BatchDecodeRequest, BatchDecodeResponse,
-    ClearCacheRequest, ClearCacheResponse,
+    ClearCacheRequest,
     ModelInfoRequest, ModelInfoResponse,
-    TokenizeRequest, TokenizeResponse,
-    PrefillRequest, DecodeRequest, GenerationParameters,
+    TokenizeRequest,
+    PrefillRequest, DecodeRequest,
 };
 
 #[derive(Clone)]
 pub struct GrpcClient {
-    inner: Arc<parking_lot::Mutex<TextGenerationServiceClient<Channel>>>,
+    inner: Arc<Mutex<TextGenerationServiceClient<Channel>>>,
 }
 
 impl GrpcClient {
@@ -48,19 +49,19 @@ impl GrpcClient {
 
         let client = TextGenerationServiceClient::new(channel);
         tracing::info!("gRPC 连接成功");
-        Ok(Self { inner: Arc::new(parking_lot::Mutex::new(client)) })
+        Ok(Self { inner: Arc::new(Mutex::new(client)) })
     }
 
     /// 获取模型信息
     pub async fn get_model_info(&self) -> anyhow::Result<ModelInfoResponse> {
-        let mut client = self.inner.lock();
+        let mut client = self.inner.lock().await;
         let resp = client.health(ModelInfoRequest {}).await?;
         Ok(resp.into_inner())
     }
 
     /// ★ Tokenize: 文本 → token 数 (供 Router 做长度验证)
     pub async fn tokenize(&self, text: &str) -> anyhow::Result<usize> {
-        let mut client = self.inner.lock();
+        let mut client = self.inner.lock().await;
         let req = TokenizeRequest { text: text.to_string() };
         let resp = client.tokenize(req).await?;
         Ok(resp.into_inner().token_count as usize)
@@ -72,7 +73,7 @@ impl GrpcClient {
         requests: Vec<PrefillRequest>,
         batch_id: i64,
     ) -> anyhow::Result<BatchPrefillResponse> {
-        let mut client = self.inner.lock();
+        let mut client = self.inner.lock().await;
         let req = BatchPrefillRequest { batch_id, requests };
         let resp = client.prefill(req).await?;
         Ok(resp.into_inner())
@@ -84,7 +85,7 @@ impl GrpcClient {
         requests: Vec<DecodeRequest>,
         batch_id: i64,
     ) -> anyhow::Result<BatchDecodeResponse> {
-        let mut client = self.inner.lock();
+        let mut client = self.inner.lock().await;
         let req = BatchDecodeRequest { batch_id, requests };
         let resp = client.decode(req).await?;
         Ok(resp.into_inner())
@@ -92,7 +93,7 @@ impl GrpcClient {
 
     /// 清理 KV cache
     pub async fn clear_cache(&self, cache_handles: Vec<i64>) -> anyhow::Result<()> {
-        let mut client = self.inner.lock();
+        let mut client = self.inner.lock().await;
         let _resp = client.clear_cache(ClearCacheRequest { cache_handles }).await?;
         Ok(())
     }

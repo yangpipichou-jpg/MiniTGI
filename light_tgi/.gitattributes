@@ -1,0 +1,30 @@
+# ============================================
+# 换行符统一规则（彻底消灭 LF/CRLF 警告）
+# ============================================
+
+# 默认：自动处理，但检出时统一转为 LF（跨平台协作最佳实践）
+* text=auto eol=lf
+
+# 明确指定文本文件类型
+*.rs text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.py text eol=lf
+*.pyi text eol=lf
+*.proto text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# 明确指定二进制文件（不转换）
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.pdb binary
+*.zip binary
+*.tar.gz binary

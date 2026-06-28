@@ -9,7 +9,6 @@
 //!                  ↓            ↓
 //!               ERROR        ERROR
 
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::event_bus::{EventBus, QueueToken, ScheduleCommand, SessionEvent};
@@ -103,7 +102,7 @@ impl Session {
                     );
                 }
 
-                Some(ScheduleCommand::StartDecode { batch_id, .. }) => {
+                Some(ScheduleCommand::StartDecode { .. }) => {
                     self.state = SessionState::Decoding;
                     if let Err(e) = self.do_decode().await {
                         tracing::error!(
@@ -242,7 +241,7 @@ impl Session {
             .await?;
 
         for resp in response.responses {
-            if let Some(token) = resp.generated_token {
+            if let Some(ref token) = resp.generated_token {
                 self.generated_count += 1;
 
                 let finish_reason = match resp.finish_reason() {
