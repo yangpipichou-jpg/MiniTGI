@@ -1,1 +1,17 @@
- 
+# Rust 编译输出（最重要！）
+router/target/
+
+# Protobuf 生成的 Python 代码
+model_server/*_pb2.py
+model_server/*_pb2_grpc.py
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 第三方工具二进制文件
+*.exe
+protoc.exe
+
+# 如果你不想提交 Cargo.lock（仅限库项目，二进制项目应保留）
+# router/Cargo.lock 

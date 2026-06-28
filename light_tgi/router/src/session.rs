@@ -219,6 +219,15 @@ impl Session {
 
         if self.generated_count >= self.max_new_tokens {
             self.state = SessionState::Finished;
+            // Notify HTTP side: request finished
+            self.event_bus.publish_token(QueueToken {
+                request_id: self.request_id.clone(),
+                token_id: 0,
+                token_text: String::new(),
+                is_finished: true,
+                finish_reason: Some("length".into()),
+            });
+            // Notify Scheduler: decode done
             self.event_bus.publish_session_event(SessionEvent::DecodeDone {
                 request_id: self.request_id.clone(),
                 token_id: 0,
