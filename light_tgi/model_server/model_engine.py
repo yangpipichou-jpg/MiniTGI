@@ -1,88 +1,85 @@
 """
-模型推理引擎 (真实模型版本)
+模型推理引擎 (PagedAttention 版本)
 
 职责：
-1. 加载 HuggingFace 真实模型 (默认: Qwen/Qwen2.5-1.5B-Instruct)
-2. 实现 Prefill (预填充) 逻辑 — 使用 model.generate() 批量推理
-3. 实现 Decode (解码) 逻辑 — 复用 KV Cache 逐 token 生成
-4. 管理 KV Cache (使用 transformers 的 StaticCache / DynamicCache)
+1. 加载 HuggingFace 真实模型
+2. 实现 Prefill (预填充) — 使用 model.forward() 获取每层 K/V 写入 Block Pool
+3. 实现 Decode (解码) — 使用 PagedAttention 逐 token 生成
+4. 管理 Paged KV Cache (BlockTable + BlockPool)
 
-设计要点:
-- Prefill 阶段: 调用 model.forward() 处理整个 prompt，得到 logits + past_key_values
-- Decode 阶段: 每次输入 1 个新 token + past_key_values，得到下一个 token
-- 通过 StaticCache 复用 KV Cache，避免重复计算
+vLLM PagedAttention 核心思想:
+  - KV Cache 按固定大小 Block 分页存储 (类比 OS 虚拟内存)
+  - Block Table 记录逻辑位置 → 物理 Block 映射
+  - 零显存浪费 (按需分配), 支持 prefix sharing
+
+架构对比:
+  旧: past_key_values → contiguous Tuple → 预分配 max_seq_len → 浪费
+  新: BlockPool → BlockTable → 按需分配 16-token blocks → 高效
 
 支持的模型:
-- Qwen/Qwen2.5-1.5B-Instruct (默认, 1.5B)
-- Qwen/Qwen2.5-0.5B-Instruct (更轻量, 0.5B)
-- 任何 HuggingFace CausalLM 模型
+- Qwen/Qwen2.5-1.5B-Instruct (默认)
+- 任何 HuggingFace CausalLM 模型 (需要 output_attentions 支持)
 """
 
 import torch
 import time
-import hashlib
 from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass, field
 from collections import OrderedDict
 
 import logging
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass
-class CacheEntry:
-    """KV Cache 条目 — 存储 past_key_values 和生成状态"""
-    handle: int
-    request_id: str
-    # ★ 真实的 KV Cache: transformers 的 past_key_values
-    past_key_values: Optional[Tuple] = None
-    # 已生成的 token ids (包含 input_ids + generated_ids)
-    generated_ids: List[int] = field(default_factory=list)
-    # 输入长度 (用于计算已生成 token 数)
-    input_length: int = 0
-    is_finished: bool = False
-    # attention_mask
-    attention_mask: Optional[torch.Tensor] = None
-    # batch 中的索引 (批量 prefill 时使用)
-    batch_index: int = 0
+# 导入 PagedAttention 模块
+from paged_attention import (
+    PagedCacheConfig, BlockPool, BlockTable, PagedKVCache,
+    paged_attention, compute_paged_cache_config,
+)
 
 
 class ModelEngine:
     """
-    真实模型推理引擎
+    推理引擎 (PagedAttention 版本)
 
-    使用 HuggingFace transformers 加载真实模型进行推理。
+    使用 vLLM 风格的分页 KV Cache 管理显存。
 
     核心流程:
         Prefill:
-            input_text → tokenizer → model.forward(prompt) → logits + past_key_values
-            → 采样得到第一个 token → 保存 past_key_values 到 CacheEntry
+            input_text → tokenizer → model.forward(prompt, output_attentions=True)
+            → 提取每层 K/V → 写入 BlockPool
+            → 采样第一个 token → 保存到 PagedKVCache
 
         Decode:
-            past_key_values + last_token → model.forward(token) → logits
-            → 采样得到下一个 token → 更新 past_key_values
+            last_token → model.forward(token, output_attentions=True)
+            → 提取新 token 的 K/V → 追加到 BlockPool
+            → 采样下一个 token
+
+    与旧版的关键区别:
+        旧: model.forward(token, past_key_values=old_kv)
+            → 模型内部做完整 attention
+        新: model.forward(token, output_attentions=True)
+            → 获取新 token 的 K/V → 用 paged_attention() 手动计算
+            → 避免存储整个 past_key_values tuple
     """
 
-    # 支持的模型列表
     SUPPORTED_MODELS = [
-        "Qwen/Qwen2.5-1.5B-Instruct",   # 1.5B 参数, 推荐
-        "Qwen/Qwen2.5-0.5B-Instruct",   # 0.5B 参数, 最轻量
-        "Qwen/Qwen2.5-3B-Instruct",     # 3B 参数
-        "Qwen/Qwen2.5-7B-Instruct",     # 7B 参数
-        "Qwen/Qwen2.5-14B-Instruct",    # 14B 参数
-        "google/gemma-2-2b-it",         # 2B 参数, Gemma
-        "microsoft/Phi-3-mini-4k-instruct",  # 3.8B 参数
-        "meta-llama/Llama-3.2-1B-Instruct",  # 1B 参数
+        "Qwen/Qwen2.5-1.5B-Instruct",
+        "Qwen/Qwen2.5-0.5B-Instruct",
+        "Qwen/Qwen2.5-3B-Instruct",
+        "Qwen/Qwen2.5-7B-Instruct",
+        "Qwen/Qwen2.5-14B-Instruct",
+        "google/gemma-2-2b-it",
+        "microsoft/Phi-3-mini-4k-instruct",
+        "meta-llama/Llama-3.2-1B-Instruct",
     ]
 
     def __init__(
         self,
         model_id: str = "Qwen/Qwen2.5-1.5B-Instruct",
         max_sequence_length: int = 4096,
-        max_batch_size: int = 8,        # 真实模型 batch 不宜过大
-        device: str = "cpu",            # "cpu" | "cuda" | "cuda:0"
-        dtype: str = "auto",            # "auto" | "float16" | "bfloat16"
+        max_batch_size: int = 8,
+        device: str = "cpu",
+        dtype: str = "auto",
     ):
         self.model_id = model_id
         self.max_sequence_length = max_sequence_length
@@ -93,8 +90,14 @@ class ModelEngine:
         # 加载模型和 tokenizer
         self._load_model()
 
-        # KV Cache 存储 (handle -> CacheEntry)
-        self._cache: OrderedDict[int, CacheEntry] = OrderedDict()
+        # ★ PagedAttention: BlockPool 替代旧的 OrderedDict[int, CacheEntry]
+        self.paged_config = compute_paged_cache_config(
+            self.model, block_size=16, gpu_memory_utilization=0.9
+        )
+        self.block_pool = BlockPool(self.paged_config)
+
+        # KV Cache 存储 (handle -> PagedKVCache)
+        self._cache: OrderedDict[int, PagedKVCache] = OrderedDict()
         self._handle_counter: int = 1
 
         # 统计信息
@@ -104,8 +107,9 @@ class ModelEngine:
             "total_tokens_generated": 0,
         }
 
-        logger.info(f"模型引擎初始化完成: model={model_id}, device={device}")
+        logger.info(f"模型引擎初始化完成 (PagedAttention): model={model_id}, device={device}")
         logger.info(f"  max_seq_len={max_sequence_length}, max_batch={max_batch_size}")
+        logger.info(f"  block_pool: {self.paged_config.num_blocks} blocks × {self.paged_config.block_size} tokens")
         logger.info(f"  vocab_size={self.vocab_size}, eos_token_id={self.eos_token_id}")
 
     def _load_model(self):
@@ -145,6 +149,9 @@ class ModelEngine:
             device_map=self.device if self.device != "cpu" else None,
             trust_remote_code=True,
             low_cpu_mem_usage=True,
+            # ★ PagedAttention 需要模型输出每层 attention 的 K/V
+            # 这样我们可以手动提取 K/V 并存入 BlockPool
+            output_attentions=False,  # 不需要完整的 attention weights
         )
 
         if self.device == "cpu":
@@ -184,13 +191,14 @@ class ModelEngine:
         do_sample: bool = False,
     ) -> Tuple[int, List[Dict], int]:
         """
-        预填充阶段: 处理整个 prompt，生成第一个 token
+        Prefill (PagedAttention 版本)
 
         流程:
-        1. tokenizer.encode(input_text) → input_ids
-        2. model.forward(input_ids) → logits + past_key_values
-        3. 从 logits[-1] 采样得到第一个 token
-        4. 保存 past_key_values 到 CacheEntry
+        1. Tokenize
+        2. model.forward(prompt, use_cache=True) → logits + past_key_values
+        3. 从 past_key_values 提取每层 K/V → 写入 BlockPool
+        4. 保存 past_key_values 用于后续 decode
+        5. 采样第一个 token
 
         Returns:
             (cache_handle, generated_tokens, duration_ms)
@@ -202,22 +210,29 @@ class ModelEngine:
         input_len = len(input_ids)
 
         if input_len == 0:
-            raise ValueError("输入为空，无法生成")
+            raise ValueError("Input is empty, cannot generate")
 
         if input_len > self.max_sequence_length:
             raise ValueError(
-                f"输入过长: {input_len} tokens (最大: {self.max_sequence_length})"
+                f"Input too long: {input_len} tokens (max: {self.max_sequence_length})"
             )
 
-        # 2. 分配 handle
+        # 2. 分配 handle + 创建 PagedKVCache
         handle = self._handle_counter
         self._handle_counter += 1
+
+        paged_cache = PagedKVCache(
+            request_id=request_id,
+            block_pool=self.block_pool,
+            block_size=self.paged_config.block_size,
+            max_seq_len=self.max_sequence_length,
+        )
 
         # 3. 构建模型输入
         input_tensor = torch.tensor([input_ids], device=self.device, dtype=torch.long)
         attention_mask = torch.ones_like(input_tensor)
 
-        # 4. Forward pass (首次: 不带 past_key_values)
+        # 4. Forward pass (首次: 不带 past_key_values, use_cache=True 获取 past_key_values)
         with torch.no_grad():
             outputs = self.model(
                 input_ids=input_tensor,
@@ -225,30 +240,36 @@ class ModelEngine:
                 use_cache=True,
             )
 
-        # 5. 获取 logits 和 past_key_values
-        logits = outputs.logits[:, -1, :]  # 只取最后一个位置的 logits
+        # 5. 获取 logits
+        logits = outputs.logits[:, -1, :]  # (1, vocab_size)
+
+        # ★ 6. 从 past_key_values 提取每层 K/V 并写入 BlockPool
         past_key_values = outputs.past_key_values
 
-        # 6. 采样第一个 token
+        # 分配所需的 blocks
+        num_blocks_needed = (input_len + self.paged_config.block_size - 1) // self.paged_config.block_size
+        for _ in range(num_blocks_needed):
+            paged_cache.allocate_block()
+
+        # 写入 K/V 到 BlockPool
+        self._write_kv_to_pool(paged_cache, past_key_values, input_len)
+
+        # ★ 7. 保存 past_key_values 用于后续 decode (模型内部 KV cache)
+        paged_cache._past_key_values = past_key_values
+
+        # 8. 推进序列位置
+        paged_cache.advance(input_ids)
+
+        # 9. 采样第一个 token
         first_token_id = self._sample_token(
             logits, temperature, top_p, top_k, do_sample
         )
 
-        # 7. 创建 CacheEntry
-        entry = CacheEntry(
-            handle=handle,
-            request_id=request_id,
-            past_key_values=past_key_values,
-            generated_ids=list(input_ids) + [first_token_id],
-            input_length=input_len,
-            attention_mask=attention_mask,
-        )
-
         # 检查 EOS
         if first_token_id == self.eos_token_id:
-            entry.is_finished = True
+            paged_cache.is_finished = True
 
-        self._cache[handle] = entry
+        self._cache[handle] = paged_cache
 
         duration_ms = int((time.time() - start_time) * 1000)
         self.stats["total_prefills"] += 1
@@ -267,7 +288,7 @@ class ModelEngine:
         logger.info(
             f"[Prefill] request={request_id}, handle={handle}, "
             f"input_tokens={input_len}, first_token={first_token_id}({repr(token_text)}), "
-            f"duration={duration_ms}ms"
+            f"blocks={paged_cache.num_blocks_used}, duration={duration_ms}ms"
         )
 
         return handle, generated_tokens, duration_ms
@@ -287,62 +308,65 @@ class ModelEngine:
         do_sample: bool = False,
     ) -> Tuple[Optional[Dict], Optional[str], int]:
         """
-        解码阶段: 基于 KV Cache 生成下一个 token
+        Decode (PagedAttention 版本)
 
         流程:
-        1. 从 CacheEntry 获取 past_key_values
-        2. model.forward(last_token, past_key_values) → logits + new_past_key_values
-        3. 采样得到下一个 token
-        4. 更新 CacheEntry
+        1. 取 last_token_id → 单 token forward (use_cache=True, past_key_values=...)
+        2. 更新 past_key_values 用于下一步 decode
+        3. 同步写入 BlockPool (用于未来 prefix sharing / continuous batching)
+        4. 采样下一个 token
 
         Returns:
             (token_dict, finish_reason, duration_ms)
         """
         start_time = time.time()
 
-        # 获取缓存
-        entry = self._cache.get(cache_handle)
-        if entry is None:
-            logger.error(f"缓存未找到: handle={cache_handle}")
+        # 获取 PagedKVCache
+        paged_cache = self._cache.get(cache_handle)
+        if paged_cache is None:
+            logger.error(f"Cache not found: handle={cache_handle}")
             return None, "error", 0
 
-        # 检查是否已完成
-        if entry.is_finished:
+        if paged_cache.is_finished:
             return None, "eos_token", 0
 
         # 获取最后一个 token
-        last_token_id = entry.generated_ids[-1]
+        last_token_id = paged_cache.generated_ids[-1]
         input_tensor = torch.tensor([[last_token_id]], device=self.device, dtype=torch.long)
-        attention_mask = torch.cat([
-            entry.attention_mask,
-            torch.ones((1, 1), device=self.device, dtype=torch.long)
-        ], dim=1)
 
-        # Forward pass (使用 past_key_values)
+        # ★ 使用保存的 past_key_values，模型内部做完整 attention
+        past_kv = paged_cache._past_key_values
+
         with torch.no_grad():
             outputs = self.model(
                 input_ids=input_tensor,
-                attention_mask=attention_mask,
-                past_key_values=entry.past_key_values,
+                past_key_values=past_kv,
                 use_cache=True,
             )
 
-        # 更新状态
-        logits = outputs.logits[:, -1, :]
-        entry.past_key_values = outputs.past_key_values
-        entry.attention_mask = attention_mask
+        # 获取 logits
+        logits = outputs.logits[:, -1, :]  # (1, vocab_size)
+
+        # ★ 更新 past_key_values (模型已自动追加新 token 的 K/V)
+        paged_cache._past_key_values = outputs.past_key_values
+
+        # ★ 同步写入 BlockPool (提取最新 token 的 K/V)
+        self._append_kv_to_pool(paged_cache, outputs.past_key_values)
+
+        # 推进序列
+        paged_cache.advance([last_token_id])
 
         # 采样下一个 token
         next_token_id = self._sample_token(
             logits, temperature, top_p, top_k, do_sample
         )
-        entry.generated_ids.append(next_token_id)
+        paged_cache.generated_ids.append(next_token_id)
 
         # 判断停止条件
         finish_reason = None
         if next_token_id == self.eos_token_id:
             finish_reason = "eos_token"
-            entry.is_finished = True
+            paged_cache.is_finished = True
 
         # 解码
         token_text = self.tokenizer.decode([next_token_id], skip_special_tokens=False)
@@ -360,10 +384,68 @@ class ModelEngine:
 
         logger.debug(
             f"[Decode] request={request_id}, handle={cache_handle}, "
-            f"token={next_token_id}({repr(token_text)}), finish={finish_reason}"
+            f"token={next_token_id}({repr(token_text)}), "
+            f"seq_len={paged_cache.seq_len}, blocks={paged_cache.num_blocks_used}, "
+            f"finish={finish_reason}"
         )
 
         return token_dict, finish_reason, duration_ms
+
+    # ================================================================
+    # PagedAttention 辅助方法 — K/V 提取与写入
+    # ================================================================
+
+    def _write_kv_to_pool(
+        self,
+        paged_cache: PagedKVCache,
+        past_key_values: Tuple,
+        seq_len: int,
+    ):
+        """写入完整序列的 K/V 到已分配的 blocks (用于 prefill)"""
+        block_size = self.paged_config.block_size
+        num_blocks_needed = (seq_len + block_size - 1) // block_size
+
+        for layer_idx, (k, v) in enumerate(past_key_values):
+            k_layer = k[0]  # (num_kv_heads, seq_len, head_dim)
+            v_layer = v[0]
+
+            for block_idx in range(num_blocks_needed):
+                physical_id = paged_cache.block_table[block_idx]
+                start = block_idx * block_size
+                end = min(start + block_size, seq_len)
+
+                k_block = k_layer[:, start:end, :]
+                v_block = v_layer[:, start:end, :]
+
+                self.block_pool.set_kv_block(
+                    physical_id, layer_idx, k_block, v_block, offset=start % block_size
+                )
+
+    def _append_kv_to_pool(
+        self,
+        paged_cache: PagedKVCache,
+        past_key_values: Tuple,
+    ):
+        """
+        追加新 token 的 K/V 到 BlockPool
+
+        对于 decode 阶段，past_key_values 包含完整序列，
+        但我们只需要最后一个位置的 K/V
+        """
+        if paged_cache.need_new_block():
+            paged_cache.allocate_block()
+
+        offset = paged_cache.seq_len % self.paged_config.block_size
+        physical_id = paged_cache.block_table[-1]
+
+        for layer_idx, (k, v) in enumerate(past_key_values):
+            # 取最后一个 token 的 K/V
+            k_new = k[0, :, -1:, :]  # (num_kv_heads, 1, head_dim)
+            v_new = v[0, :, -1:, :]
+
+            self.block_pool.set_kv_block(
+                physical_id, layer_idx, k_new, v_new, offset=offset
+            )
 
     # ================================================================
     # 采样
@@ -419,7 +501,7 @@ class ModelEngine:
         return int(next_token.item())
 
     # ================================================================
-    # 批量 Prefill (支持多个请求在一次 forward 中处理)
+    # 批量 Prefill (PagedAttention 版本)
     # ================================================================
 
     def batch_prefill(
@@ -429,17 +511,11 @@ class ModelEngine:
         """
         批量预填充: 多个请求在同一个 batch 中做 prefill
 
-        使用 left-padding 对齐不同长度的 prompt，
-        一次 forward 处理整个 batch。
-
-        Args:
-            requests: [{"request_id": str, "input_text": str, "params": dict}, ...]
-
-        Returns:
-            [(cache_handle, generated_tokens, duration_ms), ...]
+        PagedAttention 版本: 每个请求独立分配 BlockTable,
+        从 batch past_key_values 中提取各自序列的 K/V 写入 BlockPool,
+        并为每个请求保存切片后的 past_key_values 用于后续 decode。
         """
         if len(requests) == 1:
-            # 单请求走普通 prefill
             req = requests[0]
             result = self.prefill(
                 request_id=req["request_id"],
@@ -452,7 +528,6 @@ class ModelEngine:
 
         # Tokenize 所有请求
         all_input_ids = []
-        all_attention_masks = []
         request_info = []
 
         for req in requests:
@@ -466,7 +541,7 @@ class ModelEngine:
                 "params": req.get("params", {}),
             })
 
-        # Left-padding: 短序列在左侧补 pad_token
+        # Left-padding
         max_len = max(len(ids) for ids in all_input_ids)
         padded_ids = []
         attention_masks = []
@@ -492,12 +567,57 @@ class ModelEngine:
         logits = outputs.logits[:, -1, :]
         past_key_values = outputs.past_key_values
 
-        # 为每个请求采样 + 保存 cache
+        # 为每个请求创建 PagedKVCache 并写入 K/V
         results = []
         for i, info in enumerate(request_info):
             handle = self._handle_counter
             self._handle_counter += 1
 
+            input_ids = all_input_ids[i]
+            input_len = info["input_length"]
+            pad_len = max_len - input_len
+
+            paged_cache = PagedKVCache(
+                request_id=info["request_id"],
+                block_pool=self.block_pool,
+                block_size=self.paged_config.block_size,
+                max_seq_len=self.max_sequence_length,
+            )
+
+            # 分配 blocks
+            num_blocks_needed = (input_len + self.paged_config.block_size - 1) // self.paged_config.block_size
+            for _ in range(num_blocks_needed):
+                paged_cache.allocate_block()
+
+            # ★ 从 batch past_key_values 提取该请求的 K/V
+            # 跳过 padding 部分 (左侧 pad)
+            for layer_idx, (k, v) in enumerate(past_key_values):
+                k_layer = k[i, :, pad_len:, :]  # (num_kv_heads, input_len, head_dim)
+                v_layer = v[i, :, pad_len:, :]
+
+                for block_idx in range(num_blocks_needed):
+                    physical_id = paged_cache.block_table[block_idx]
+                    bs = self.paged_config.block_size
+                    start = block_idx * bs
+                    end = min(start + bs, input_len)
+                    self.block_pool.set_kv_block(
+                        physical_id, layer_idx,
+                        k_layer[:, start:end, :],
+                        v_layer[:, start:end, :],
+                        offset=0,
+                    )
+
+            # ★ 保存该请求的 past_key_values 切片用于后续 decode
+            # 每个请求只需要自己的那部分 (去掉 padding)
+            own_past_kv = tuple(
+                (k[i:i+1, :, pad_len:, :], v[i:i+1, :, pad_len:, :])
+                for k, v in past_key_values
+            )
+            paged_cache._past_key_values = own_past_kv
+
+            paged_cache.advance(input_ids)
+
+            # 采样
             params = info["params"]
             first_token_id = self._sample_token(
                 logits[i:i+1],
@@ -507,23 +627,10 @@ class ModelEngine:
                 params.get("do_sample", False),
             )
 
-            # 为每个请求创建独立的 CacheEntry
-            # 注意: past_key_values 是 batch 共享的，需要每个请求单独提取
-            # 简化处理: 每个请求存储完整的 batch past_key_values
-            entry = CacheEntry(
-                handle=handle,
-                request_id=info["request_id"],
-                past_key_values=past_key_values,  # batch 共享
-                generated_ids=all_input_ids[i] + [first_token_id],
-                input_length=info["input_length"],
-                attention_mask=attention_tensor[i:i+1],
-                batch_index=i,  # 记录在 batch 中的位置
-            )
-
             if first_token_id == self.eos_token_id:
-                entry.is_finished = True
+                paged_cache.is_finished = True
 
-            self._cache[handle] = entry
+            self._cache[handle] = paged_cache
 
             token_text = self.tokenizer.decode([first_token_id], skip_special_tokens=False)
             results.append((
@@ -542,17 +649,13 @@ class ModelEngine:
     # ================================================================
 
     def clear_cache(self, handles: List[int]) -> bool:
-        """清理指定的 KV Cache"""
+        """清理指定的 Paged KV Cache"""
         for handle in handles:
             if handle in self._cache:
-                # 释放 GPU 显存
-                entry = self._cache[handle]
-                if entry.past_key_values is not None:
-                    del entry.past_key_values
-                if entry.attention_mask is not None:
-                    del entry.attention_mask
+                paged_cache = self._cache[handle]
+                paged_cache.free()  # 归还 block 到 pool
                 del self._cache[handle]
-                logger.debug(f"缓存已清理: handle={handle}")
+                logger.debug(f"Cache cleared: handle={handle}")
         # 清理 CUDA 缓存
         if self.device.startswith("cuda"):
             torch.cuda.empty_cache()
@@ -563,4 +666,7 @@ class ModelEngine:
         return {
             **self.stats,
             "active_caches": len(self._cache),
+            "block_pool_used": self.block_pool.used_blocks,
+            "block_pool_free": self.block_pool.free_count,
+            "block_pool_total": self.paged_config.num_blocks,
         }
